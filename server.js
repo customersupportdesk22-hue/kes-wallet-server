@@ -285,5 +285,23 @@ app.post('/api/admin/freeze/:id', auth, async (req, res) => {
   res.json({ ok: true, status: s });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;// Public live activity feed — shows recent completed payouts (first names only)
+app.get('/api/public/activity', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT t.amount, t.created_at, u.name
+     FROM txs t
+     JOIN users u ON u.id = t.user_id
+     WHERE t.type IN ('transfer_in','deposit')
+       AND t.status = 'completed'
+       AND t.amount > 0
+     ORDER BY t.created_at DESC
+     LIMIT 15`
+  );
+  const items = r.rows.map(row => ({
+    name: String(row.name||'Customer').split(' ')[0],
+    amount: row.amount,
+    at: row.created_at,
+  }));
+  res.json({ items });
+});
 app.listen(PORT, () => console.log('Server listening on port', PORT));
