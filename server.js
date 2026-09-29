@@ -617,41 +617,79 @@ app.post('/api/admin/freeze/:id', auth, async (req, res) => {
   });
 });
 
+
 const PORT = process.env.PORT || 3000;
 
 
-/*
-  PUBLIC LIVE PAYOUTS
-  ONLY RECENT COMPLETED WITHDRAWALS
-  LAST 1 HOUR
-  MAXIMUM 15 PAYOUTS
-*/
+/* =====================================================
+   LIVE PAYOUTS
+   Starts from the moment the server starts.
+   Includes customer withdrawals and admin payouts.
+   ===================================================== */
+
+const LIVE_PAYOUTS_START_TIME = new Date();
+
 
 app.get('/api/public/activity', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT t.amount, t.created_at, u.name
-     FROM txs t
-     JOIN users u ON u.id = t.user_id
-     WHERE t.type = 'withdrawal'
-       AND t.status = 'completed'
-       AND t.amount > 0
-       AND t.created_at >= NOW() - INTERVAL '1 hour'
-     ORDER BY t.created_at DESC
-     LIMIT 15`
-  );
+  try {
+    const r = await pool.query(
+      `SELECT t.amount, t.created_at, t.type, u.name
+       FROM txs t
+       JOIN users u ON u.id = t.user_id
+       WHERE t.type IN ('withdrawal', 'admin_payout')
+         AND t.status = 'completed'
+         AND t.amount > 0
+         AND t.created_at >= $1
+       ORDER BY t.created_at DESC
+       LIMIT 15`,
+      [LIVE_PAYOUTS_START_TIME]
+    );
 
-  const items = r.rows.map(row => ({
-    name: String(row.name || 'Customer').split(' ')[0],
-    amount: row.amount,
-    at: row.created_at
-  }));
+    const items = r.rows.map(row => {
 
-  res.json({
-    items
-  });
+      const customerName =
+        String(row.name || 'Customer').split(' ')[0];
+
+      const amount = Number(row.amount);
+
+      let message;
+
+      if (row.type === 'admin_payout') {
+        message =
+          `${customerName} have received KES ${amount.toLocaleString('en-KE')} from Biashara Loans`;
+      } else {
+        message =
+          `${customerName} have received KES ${amount.toLocaleString('en-KE')} from Biashara Loans`;
+      }
+
+      return {
+        name: customerName,
+        amount: amount,
+        sender: 'Biashara Loans',
+        type: row.type,
+        message: message,
+        at: row.created_at
+      };
+    });
+
+    res.json({
+      items
+    });
+
+  } catch (e) {
+    console.error(e);
+
+    res.status(500).json({
+      error: 'Could not load live payouts'
+    });
+  }
 });
 
 
 app.listen(PORT, () => {
   console.log('Server listening on port', PORT);
+  console.log(
+    'Live payouts start time:',
+    LIVE_PAYOUTS_START_TIME.toISOString()
+  );
 });
