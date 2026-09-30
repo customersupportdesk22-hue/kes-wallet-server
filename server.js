@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { MongoClient, ObjectId } = require('mongodb');
+const AfricasTalking = require('africastalking');
 
 const app = express();
 app.use(cors());
@@ -14,6 +15,41 @@ const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
 const WELCOME_BONUS = 100;
 const REFERRAL_BONUS = 50;
+
+// Africa's Talking
+const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
+const AT_API_KEY = process.env.AT_API_KEY || '';
+let atSms = null;
+try {
+  const at = AfricasTalking({ username: AT_USERNAME, apiKey: AT_API_KEY });
+  atSms = at.SMS;
+  console.log('Africa\'s Talking initialized');
+} catch(e) {
+  console.log('AT init failed:', e.message);
+}
+
+function normalizePhone(input) {
+  let p = String(input || '').replace(/[^\d+]/g, '');
+  if (p.startsWith('+')) p = p.slice(1);
+  if (p.startsWith('0')) p = '254' + p.slice(1);
+  if (p.startsWith('7') || p.startsWith('1')) p = '254' + p;
+  return p;
+}
+
+async function sendSMS(phone, message) {
+  if (!atSms || !AT_API_KEY) {
+    console.log('SMS skipped - AT not configured');
+    return;
+  }
+  try {
+    const to = '+' + normalizePhone(phone);
+    const result = await atSms.send({ to: [to], message });
+    console.log('SMS sent to', to);
+    return result;
+  } catch(e) {
+    console.error('SMS failed:', e.message);
+  }
+}
 
 let db, users, txs, loans;
 
@@ -28,14 +64,6 @@ async function connectDB() {
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ referral_code: 1 });
   console.log('MongoDB connected');
-}
-
-function normalizePhone(input) {
-  let p = String(input || '').replace(/[^\d+]/g, '');
-  if (p.startsWith('+')) p = p.slice(1);
-  if (p.startsWith('0')) p = '254' + p.slice(1);
-  if (p.startsWith('7') || p.startsWith('1')) p = '254' + p;
-  return p;
 }
 
 function sanitize(u) {
@@ -102,12 +130,7 @@ function buildSchedule(loan) {
   for (let i = 1; i <= loan.months; i++) {
     const dueDate = new Date(start);
     dueDate.setMonth(dueDate.getMonth() + i);
-    schedule.push({
-      month: i,
-      due_date: dueDate,
-      amount: loan.monthly,
-      status: 'pending',
-    });
+    schedule.push({ month: i, due_date: dueDate, amount: loan.monthly, status: 'pending' });
   }
   return schedule;
 }
@@ -143,7 +166,6 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Welcome bonus
     await txs.insertOne({
       user_id: result.insertedId.toString(),
       type: 'deposit',
@@ -155,19 +177,15 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Referral bonus
+    // Welcome SMS
+    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. You've received KES ${WELCOME_BONUS} bonus. Apply for a loan: https://loans-apply-now.netlify.app`);
+
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
       const referrer = await users.findOne({ referral_code: refCode });
       if (referrer && referrer._id.toString() !== result.insertedId.toString()) {
-        await users.updateOne(
-          { _id: referrer._id },
-          { $inc: { balance: REFERRAL_BONUS } }
-        );
-        await users.updateOne(
-          { _id: result.insertedId },
-          { $set: { referred_by: referrer._id.toString() } }
-        );
+        await users.updateOne({ _id: referrer._id }, { $inc: { balance: REFERRAL_BONUS } });
+        await users.updateOne({ _id: result.insertedId }, { $set: { referred_by: referrer._id.toString() } });
         await txs.insertOne({
           user_id: referrer._id.toString(),
           type: 'deposit',
@@ -178,6 +196,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
+        sendSMS(referrer.phone, `Great news! You earned KES ${REFERRAL_BONUS} referral bonus because ${name.split(' ')[0]} joined using your code.`);
       }
     }
 
@@ -193,8 +212,7 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ error: 'Missing email or password' });
+    if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
 
     const user = await users.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ error: 'No account found' });
@@ -205,7 +223,6 @@ app.post('/api/login', async (req, res) => {
     const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: '90d' });
     res.json({ token, user: sanitize(user) });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -224,8 +241,7 @@ app.get('/api/me', auth, async (req, res) => {
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
   try {
-    const list = await txs.find({ user_id: req.userId })
-      .sort({ created_at: -1 }).limit(100).toArray();
+    const list = await txs.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(100).toArray();
     const formatted = list.map(t => ({
       id: t._id.toString(),
       type: t.type,
@@ -243,17 +259,13 @@ app.get('/api/wallet/txs', auth, async (req, res) => {
   }
 });
 
-// ============ DEPOSIT (ADMIN ONLY) ============
 app.post('/api/wallet/deposit', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
-    // Only admins can deposit
     const me = await getUserById(req.userId);
-    if (!me || me.role !== 'admin') {
-      return res.status(403).json({ error: 'Only admins can deposit' });
-    }
+    if (!me || me.role !== 'admin') return res.status(403).json({ error: 'Only admins can deposit' });
 
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: amt } });
     await txs.insertOne({
@@ -292,6 +304,8 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       mpesa_receipt: 'QK' + Date.now().toString().slice(-8),
       created_at: new Date(),
     });
+
+    sendSMS(user.phone, `You withdrew KES ${amt.toLocaleString()} from your Biashara Boost wallet. New balance: KES ${(user.balance - amt).toLocaleString()}.`);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
@@ -339,17 +353,17 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    // Admin sending "LOAN:X" creates a loan record for recipient
+    // Send SMS to recipient
+    sendSMS(recipient.phone, `You received KES ${amt.toLocaleString()} from ${sender.name}. Your Biashara Boost wallet has been updated.`);
+
+    // Admin sending LOAN:X creates loan record
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
       const rate = 10;
       const r = rate / 100 / 12;
       let monthly;
       if (r === 0) monthly = amt / months;
-      else {
-        const f = Math.pow(1 + r, months);
-        monthly = amt * r * f / (f - 1);
-      }
+      else { const f = Math.pow(1 + r, months); monthly = amt * r * f / (f - 1); }
       monthly = Math.round(monthly);
       const total = monthly * months;
       const dueDate = new Date();
@@ -369,13 +383,13 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         created_at: new Date(),
         due_date: dueDate,
       });
+
+      // Loan approval SMS
+      sendSMS(recipient.phone, `Great news! Your loan of KES ${amt.toLocaleString()} has been approved and sent to your wallet. Repay KES ${monthly.toLocaleString()}/month for ${months} months. Log in to view details.`);
     }
 
     const updated = await getUserById(req.userId);
-    res.json({
-      balance: updated.balance,
-      recipient: { name: recipient.name, phone: recipient.phone },
-    });
+    res.json({ balance: updated.balance, recipient: { name: recipient.name, phone: recipient.phone } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Transfer failed' });
@@ -387,10 +401,7 @@ app.get('/api/lookup/:phone', async (req, res) => {
     const norm = normalizePhone(req.params.phone);
     const user = await users.findOne({ phone: norm });
     if (!user) return res.json({ found: false });
-    res.json({
-      found: true,
-      user: { name: user.name, phone: user.phone, status: user.status || 'active' },
-    });
+    res.json({ found: true, user: { name: user.name, phone: user.phone, status: user.status || 'active' } });
   } catch (e) {
     res.json({ found: false });
   }
@@ -400,8 +411,7 @@ app.get('/api/lookup/:phone', async (req, res) => {
 
 app.get('/api/loans', auth, async (req, res) => {
   try {
-    const list = await loans.find({ user_id: req.userId })
-      .sort({ created_at: -1 }).toArray();
+    const list = await loans.find({ user_id: req.userId }).sort({ created_at: -1 }).toArray();
     res.json({ loans: list.map(formatLoan) });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
@@ -410,10 +420,7 @@ app.get('/api/loans', auth, async (req, res) => {
 
 app.get('/api/loans/:id', auth, async (req, res) => {
   try {
-    const loan = await loans.findOne({
-      _id: new ObjectId(req.params.id),
-      user_id: req.userId
-    });
+    const loan = await loans.findOne({ _id: new ObjectId(req.params.id), user_id: req.userId });
     if (!loan) return res.status(404).json({ error: 'Not found' });
     res.json({ loan: formatLoan(loan), schedule: buildSchedule(loan) });
   } catch (e) {
@@ -421,17 +428,12 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED ============
-// Only shows REAL deposits — skips:
-//   1. Admin accounts
-//   2. Welcome bonuses (marked is_bonus: true)
-//   3. Referral bonuses (marked is_bonus: true)
+// ============ PUBLIC FEED ============
+
 app.get('/api/public/activity', async (req, res) => {
   try {
-    const recent = await txs.find({
-      type: 'deposit',
-      is_bonus: { $ne: true }
-    }).sort({ created_at: -1 }).limit(30).toArray();
+    const recent = await txs.find({ type: 'deposit', is_bonus: { $ne: true } })
+      .sort({ created_at: -1 }).limit(30).toArray();
 
     const items = [];
     for (const t of recent) {
@@ -449,11 +451,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-// ============ HEALTH ============
-
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running' }));
-
-// ============ START ============
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
