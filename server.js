@@ -42,8 +42,9 @@ async function sendSMS(phone, message) {
   }
   try {
     const to = '+' + normalizePhone(phone);
+    console.log('Sending SMS to', to, 'Message:', message);
     const result = await atSms.send({ to: [to], message });
-    console.log('SMS sent to', to);
+    console.log('SMS result:', JSON.stringify(result));
     return result;
   } catch(e) {
     console.error('SMS failed:', e.message);
@@ -176,8 +177,8 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Welcome SMS
-    sendSMS(norm, `Biashara Boost: Welcome ${name.split(' ')[0]}! Your wallet is ready with KES ${WELCOME_BONUS} bonus. Apply for a loan on our app. Stop dial *456*9*5#`);
+    // SIMPLE TEST MESSAGE
+    sendSMS(norm, 'Hello, this is a test message from Biashara Boost Loans.');
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -195,7 +196,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        sendSMS(referrer.phone, `Biashara Boost: You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}. Stop dial *456*9*5#`);
+        sendSMS(referrer.phone, 'Hello, you have earned a referral bonus from Biashara Boost Loans.');
       }
     }
 
@@ -304,7 +305,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(user.phone, `Biashara Boost: You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}. Stop dial *456*9*5#`);
+    sendSMS(user.phone, 'Hello, your withdrawal has been processed. Biashara Boost Loans.');
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
@@ -352,7 +353,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(recipient.phone, `Biashara Boost: You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}. Stop dial *456*9*5#`);
+    sendSMS(recipient.phone, 'Hello, you have received a deposit in your Biashara Boost wallet.');
 
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
@@ -381,7 +382,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      sendSMS(recipient.phone, `Biashara Boost: Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months. Stop dial *456*9*5#`);
+      sendSMS(recipient.phone, 'Hello, your Biashara Boost loan has been approved and credited.');
     }
 
     const updated = await getUserById(req.userId);
