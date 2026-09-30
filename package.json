@@ -8,6 +8,7 @@
     "cors": "^2.8.5",
     "mongodb": "^6.3.0",
     "bcryptjs": "^2.4.3",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "africastalking": "^0.7.0"
   }
 }
