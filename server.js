@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
-const WELCOME_BONUS = 100;   // KES for new users
-const REFERRAL_BONUS = 50;   // KES to referrer
+const WELCOME_BONUS = 100;
+const REFERRAL_BONUS = 50;
 
 let db, users, txs, loans;
 
@@ -143,7 +143,7 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Welcome bonus transaction
+    // Welcome bonus
     await txs.insertOne({
       user_id: result.insertedId.toString(),
       type: 'deposit',
@@ -154,7 +154,7 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Handle referral
+    // Referral bonus
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
       const referrer = await users.findOne({ referral_code: refCode });
@@ -241,10 +241,17 @@ app.get('/api/wallet/txs', auth, async (req, res) => {
   }
 });
 
+// ============ DEPOSIT (ADMIN ONLY) ============
 app.post('/api/wallet/deposit', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    // Only admins can deposit
+    const me = await getUserById(req.userId);
+    if (!me || me.role !== 'admin') {
+      return res.status(403).json({ error: 'Only admins can deposit' });
+    }
 
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: amt } });
     await txs.insertOne({
@@ -330,7 +337,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    // Admin sending "LOAN:X" creates loan record for recipient
+    // Admin sending "LOAN:X" creates a loan record for recipient
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
       const rate = 10;
