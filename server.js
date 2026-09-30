@@ -68,6 +68,8 @@ function makeRef() {
   return 'BB' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 90 + 10);
 }
 
+// ============ AUTH ============
+
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, phone, password, idNumber } = req.body;
@@ -132,6 +134,8 @@ app.get('/api/me', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed' });
   }
 });
+
+// ============ WALLET ============
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
   try {
@@ -268,15 +272,22 @@ app.get('/api/lookup/:phone', async (req, res) => {
   }
 });
 
+// ============ PUBLIC LIVE PAYOUTS FEED ============
+// Returns last 10 deposits made to NON-admin users.
+// Admin deposits never appear publicly.
 app.get('/api/public/activity', async (req, res) => {
   try {
-    const recent = await txs.find({ type: 'deposit' }).sort({ created_at: -1 }).limit(10).toArray();
+    const recent = await txs.find({ type: 'deposit' })
+      .sort({ created_at: -1 }).limit(30).toArray();
+
     const items = [];
     for (const t of recent) {
+      if (items.length >= 10) break;
       const u = await users.findOne({ _id: new ObjectId(t.user_id) });
-      if (u) {
-        const parts = (u.name || 'User').split(' ');
-        const masked = parts[0] + ' ' + (parts[1] ? parts[1][0] + '.' : '');
+      // Skip admins so internal test deposits never appear publicly
+      if (u && u.role !== 'admin' && u.name !== 'BIASHARA LOANS LIMITED') {
+        const parts = (u.name || 'User').split(' ').filter(Boolean);
+        const masked = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
         items.push({ name: masked, amount: t.amount, at: t.created_at });
       }
     }
@@ -286,7 +297,11 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
+// ============ HEALTH ============
+
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running' }));
+
+// ============ START ============
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
