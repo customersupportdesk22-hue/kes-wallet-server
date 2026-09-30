@@ -151,6 +151,7 @@ app.post('/api/register', async (req, res) => {
       description: 'Welcome bonus 🎁',
       reference: makeRef(),
       status: 'completed',
+      is_bonus: true,
       created_at: new Date(),
     });
 
@@ -174,6 +175,7 @@ app.post('/api/register', async (req, res) => {
           description: `Referral bonus — ${name.split(' ')[0]} joined`,
           reference: makeRef(),
           status: 'completed',
+          is_bonus: true,
           created_at: new Date(),
         });
       }
@@ -420,11 +422,16 @@ app.get('/api/loans/:id', auth, async (req, res) => {
 });
 
 // ============ PUBLIC LIVE PAYOUTS FEED ============
-
+// Only shows REAL deposits — skips:
+//   1. Admin accounts
+//   2. Welcome bonuses (marked is_bonus: true)
+//   3. Referral bonuses (marked is_bonus: true)
 app.get('/api/public/activity', async (req, res) => {
   try {
-    const recent = await txs.find({ type: 'deposit' })
-      .sort({ created_at: -1 }).limit(30).toArray();
+    const recent = await txs.find({
+      type: 'deposit',
+      is_bonus: { $ne: true }
+    }).sort({ created_at: -1 }).limit(30).toArray();
 
     const items = [];
     for (const t of recent) {
