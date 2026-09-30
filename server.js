@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
-const WELCOME_BONUS = 100;
+const LOAN_LIMIT = 10500;
 const REFERRAL_BONUS = 50;
 
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
@@ -42,7 +42,7 @@ async function sendSMS(phone, message) {
   }
   try {
     const to = '+' + normalizePhone(phone);
-    console.log('Sending SMS to', to, 'Message:', message);
+    console.log('Sending SMS to', to);
     const result = await atSms.send({ to: [to], message });
     console.log('SMS result:', JSON.stringify(result));
     return result;
@@ -78,6 +78,7 @@ function sanitize(u) {
     status: u.status || 'active',
     id_number: u.id_number || null,
     referral_code: u.referral_code || null,
+    loan_limit: u.loan_limit || LOAN_LIMIT,
   };
 }
 
@@ -157,28 +158,18 @@ app.post('/api/register', async (req, res) => {
       email: email.toLowerCase(),
       phone: norm,
       password_hash: hash,
-      balance: WELCOME_BONUS,
+      balance: 0,
       role: 'user',
       status: 'active',
       id_number: idNumber || null,
       referral_code: userCode,
       referred_by: null,
+      loan_limit: LOAN_LIMIT,
       created_at: new Date(),
     });
 
-    await txs.insertOne({
-      user_id: result.insertedId.toString(),
-      type: 'deposit',
-      amount: WELCOME_BONUS,
-      description: 'Welcome bonus 🎁',
-      reference: makeRef(),
-      status: 'completed',
-      is_bonus: true,
-      created_at: new Date(),
-    });
-
-    // SIMPLE TEST MESSAGE
-    sendSMS(norm, 'Hello, this is a test message from Biashara Boost Loans.');
+    // Welcome SMS with loan limit
+    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost loan limit is KSh ${LOAN_LIMIT.toLocaleString()}. Log in to apply.`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -196,7 +187,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        sendSMS(referrer.phone, 'Hello, you have earned a referral bonus from Biashara Boost Loans.');
+        sendSMS(referrer.phone, `You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}.`);
       }
     }
 
@@ -305,7 +296,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(user.phone, 'Hello, your withdrawal has been processed. Biashara Boost Loans.');
+    sendSMS(user.phone, `You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}.`);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
@@ -353,7 +344,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(recipient.phone, 'Hello, you have received a deposit in your Biashara Boost wallet.');
+    sendSMS(recipient.phone, `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
 
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
@@ -382,7 +373,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      sendSMS(recipient.phone, 'Hello, your Biashara Boost loan has been approved and credited.');
+      sendSMS(recipient.phone, `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
     }
 
     const updated = await getUserById(req.userId);
