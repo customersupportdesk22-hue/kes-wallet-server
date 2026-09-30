@@ -16,14 +16,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 const WELCOME_BONUS = 100;
 const REFERRAL_BONUS = 50;
 
-// Africa's Talking
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
 const AT_API_KEY = process.env.AT_API_KEY || '';
 let atSms = null;
 try {
   const at = AfricasTalking({ username: AT_USERNAME, apiKey: AT_API_KEY });
   atSms = at.SMS;
-  console.log('Africa\'s Talking initialized');
+  console.log("Africa's Talking initialized");
 } catch(e) {
   console.log('AT init failed:', e.message);
 }
@@ -178,7 +177,7 @@ app.post('/api/register', async (req, res) => {
     });
 
     // Welcome SMS
-    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. You've received KES ${WELCOME_BONUS} bonus. Apply for a loan: https://loans-apply-now.netlify.app`);
+    sendSMS(norm, `Biashara Boost: Welcome ${name.split(' ')[0]}! Your wallet is ready with KES ${WELCOME_BONUS} bonus. Apply for a loan on our app. Stop dial *456*9*5#`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -196,7 +195,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        sendSMS(referrer.phone, `Great news! You earned KES ${REFERRAL_BONUS} referral bonus because ${name.split(' ')[0]} joined using your code.`);
+        sendSMS(referrer.phone, `Biashara Boost: You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}. Stop dial *456*9*5#`);
       }
     }
 
@@ -305,7 +304,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(user.phone, `You withdrew KES ${amt.toLocaleString()} from your Biashara Boost wallet. New balance: KES ${(user.balance - amt).toLocaleString()}.`);
+    sendSMS(user.phone, `Biashara Boost: You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}. Stop dial *456*9*5#`);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
@@ -353,10 +352,8 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    // Send SMS to recipient
-    sendSMS(recipient.phone, `You received KES ${amt.toLocaleString()} from ${sender.name}. Your Biashara Boost wallet has been updated.`);
+    sendSMS(recipient.phone, `Biashara Boost: You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}. Stop dial *456*9*5#`);
 
-    // Admin sending LOAN:X creates loan record
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
       const rate = 10;
@@ -384,8 +381,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      // Loan approval SMS
-      sendSMS(recipient.phone, `Great news! Your loan of KES ${amt.toLocaleString()} has been approved and sent to your wallet. Repay KES ${monthly.toLocaleString()}/month for ${months} months. Log in to view details.`);
+      sendSMS(recipient.phone, `Biashara Boost: Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months. Stop dial *456*9*5#`);
     }
 
     const updated = await getUserById(req.userId);
