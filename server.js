@@ -13,7 +13,6 @@ const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
-const LOAN_LIMIT = 10500;
 const REFERRAL_BONUS = 50;
 
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
@@ -78,7 +77,6 @@ function sanitize(u) {
     status: u.status || 'active',
     id_number: u.id_number || null,
     referral_code: u.referral_code || null,
-    loan_limit: u.loan_limit || LOAN_LIMIT,
   };
 }
 
@@ -164,12 +162,11 @@ app.post('/api/register', async (req, res) => {
       id_number: idNumber || null,
       referral_code: userCode,
       referred_by: null,
-      loan_limit: LOAN_LIMIT,
       created_at: new Date(),
     });
 
-    // Welcome SMS with loan limit
-    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost loan limit is KSh ${LOAN_LIMIT.toLocaleString()}. Log in to apply.`);
+    // Welcome SMS
+    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. Log in to apply for a loan.`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
