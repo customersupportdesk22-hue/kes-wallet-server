@@ -26,6 +26,9 @@ try {
   console.log('AT init failed:', e.message);
 }
 
+const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
+const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY || '';
+
 function normalizePhone(input) {
   let p = String(input || '').replace(/[^\d+]/g, '');
   if (p.startsWith('+')) p = p.slice(1);
@@ -48,6 +51,42 @@ async function sendSMS(phone, message) {
   } catch(e) {
     console.error('SMS failed:', e.message);
   }
+}
+
+async function sendPush(phone, title, message) {
+  if (!ONESIGNAL_APP_ID || !ONESIGNAL_REST_KEY) {
+    console.log('Push skipped - OneSignal not configured');
+    return;
+  }
+  try {
+    const norm = normalizePhone(phone);
+    const res = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + ONESIGNAL_REST_KEY
+      },
+      body: JSON.stringify({
+        app_id: ONESIGNAL_APP_ID,
+        include_aliases: { external_id: [norm] },
+        target_channel: 'push',
+        headings: { en: title },
+        contents: { en: message }
+      })
+    });
+    const data = await res.json();
+    console.log('Push result:', data.id || data.errors || data);
+    return data;
+  } catch(e) {
+    console.error('Push failed:', e.message);
+  }
+}
+
+async function notify(phone, title, message) {
+  await Promise.allSettled([
+    sendSMS(phone, message),
+    sendPush(phone, title, message)
+  ]);
 }
 
 let db, users, txs, loans;
@@ -165,8 +204,7 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    // Welcome SMS
-    sendSMS(norm, `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. Log in to apply for a loan.`);
+    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. Log in to apply for a loan.`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -184,7 +222,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        sendSMS(referrer.phone, `You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}.`);
+        notify(referrer.phone, '💰 Referral Bonus!', `You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}.`);
       }
     }
 
@@ -293,7 +331,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(user.phone, `You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}.`);
+    notify(user.phone, 'Withdrawal Confirmed', `You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}.`);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
@@ -341,7 +379,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    sendSMS(recipient.phone, `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
+    notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
 
     if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
       const months = parseInt(note.split(':')[1], 10) || 3;
@@ -370,7 +408,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      sendSMS(recipient.phone, `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
+      notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
     }
 
     const updated = await getUserById(req.userId);
