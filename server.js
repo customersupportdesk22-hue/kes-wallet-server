@@ -311,6 +311,7 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
   }
 });
 
+// ============ WITHDRAWAL (PENDING VERIFICATION) ============
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
@@ -319,23 +320,29 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
+    // 1. Deduct from balance immediately
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
+
+    // 2. Create the transaction as PENDING (not completed)
+    const ref = makeRef();
     await txs.insertOne({
       user_id: req.userId,
       type: 'withdrawal',
       amount: amt,
-      description: 'Withdrawal to M-Pesa',
-      reference: makeRef(),
-      status: 'completed',
-      mpesa_receipt: 'QK' + Date.now().toString().slice(-8),
+      description: 'Withdrawal to M-Pesa — Pending Verification',
+      reference: ref,
+      status: 'pending',
+      mpesa_receipt: null,
       created_at: new Date(),
     });
 
-    notify(user.phone, 'Withdrawal Confirmed', `You withdrew KES ${amt.toLocaleString()}. New balance KES ${(user.balance - amt).toLocaleString()}.`);
+    // 3. Notify user that it's pending
+    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification. Please verify via WhatsApp in the app.`);
 
     const updated = await getUserById(req.userId);
-    res.json({ balance: updated.balance });
+    res.json({ balance: updated.balance, reference: ref });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Withdrawal failed' });
   }
 });
@@ -453,13 +460,47 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED ============
-// Shows:
-//   1. Real deposits (not bonuses, not admin)
-//   2. Loan disbursements (transfer_in from admin "BIASHARA...")
+// ============ ADMIN: APPROVE WITHDRAWAL ============
+// Call this AFTER you manually send M-Pesa money to the user.
+app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const { txId, mpesaReceipt } = req.body;
+    if (!txId) return res.status(400).json({ error: 'Missing transaction ID' });
+
+    const tx = await txs.findOne({ _id: new ObjectId(txId), type: 'withdrawal' });
+    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+    if (tx.status === 'completed') return res.status(400).json({ error: 'Already completed' });
+
+    const finalReceipt = mpesaReceipt || ('QK' + Date.now().toString().slice(-8));
+
+    await txs.updateOne(
+      { _id: new ObjectId(txId) },
+      { $set: { status: 'completed', mpesa_receipt: finalReceipt } }
+    );
+
+    const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
+    if (user) {
+      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent to your M-Pesa. Receipt: ${finalReceipt}`);
+    }
+
+    res.json({ ok: true, receipt: finalReceipt });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Approval failed' });
+  }
+});
+
+// ============ PUBLIC LIVE PAYOUTS FEED (Last 2 Hours Only) ============
 app.get('/api/public/activity', async (req, res) => {
   try {
+    // Only show transactions from the last 2 hours
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
     const recent = await txs.find({
+      created_at: { $gte: twoHoursAgo },
       $or: [
         { type: 'deposit', is_bonus: { $ne: true } },
         { type: 'transfer_in', description: { $regex: /^Received from BIASHARA/i } }
