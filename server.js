@@ -204,7 +204,7 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Boost wallet is ready. Log in to apply for a loan.`);
+    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready. Log in to apply for a loan.`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -408,7 +408,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
+      notify(recipient.phone, '🎉 Congratulations Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
     } else {
       notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
     }
