@@ -379,9 +379,9 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
+    const isLoan = sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:');
 
-    if (sender.role === 'admin' && note && note.toUpperCase().startsWith('LOAN:')) {
+    if (isLoan) {
       const months = parseInt(note.split(':')[1], 10) || 3;
       const rate = 10;
       const r = rate / 100 / 12;
@@ -409,6 +409,8 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       });
 
       notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
+    } else {
+      notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
     }
 
     const updated = await getUserById(req.userId);
@@ -451,12 +453,18 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC FEED ============
-
+// ============ PUBLIC LIVE PAYOUTS FEED ============
+// Shows:
+//   1. Real deposits (not bonuses, not admin)
+//   2. Loan disbursements (transfer_in from admin "BIASHARA...")
 app.get('/api/public/activity', async (req, res) => {
   try {
-    const recent = await txs.find({ type: 'deposit', is_bonus: { $ne: true } })
-      .sort({ created_at: -1 }).limit(30).toArray();
+    const recent = await txs.find({
+      $or: [
+        { type: 'deposit', is_bonus: { $ne: true } },
+        { type: 'transfer_in', description: { $regex: /^Received from BIASHARA/i } }
+      ]
+    }).sort({ created_at: -1 }).limit(40).toArray();
 
     const items = [];
     for (const t of recent) {
