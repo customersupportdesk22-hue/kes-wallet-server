@@ -320,10 +320,8 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // 1. Deduct from balance immediately
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
 
-    // 2. Create the transaction as PENDING (not completed)
     const ref = makeRef();
     await txs.insertOne({
       user_id: req.userId,
@@ -336,7 +334,6 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    // 3. Notify user that it's pending
     notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification. Please verify via WhatsApp in the app.`);
 
     const updated = await getUserById(req.userId);
@@ -461,7 +458,6 @@ app.get('/api/loans/:id', auth, async (req, res) => {
 });
 
 // ============ ADMIN: APPROVE WITHDRAWAL ============
-// Call this AFTER you manually send M-Pesa money to the user.
 app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -493,32 +489,48 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED (Last 2 Hours Only) ============
+// ============ PUBLIC LIVE PAYOUTS FEED (Last 2 Hours, Optimized) ============
 app.get('/api/public/activity', async (req, res) => {
   try {
-    // Only show transactions from the last 2 hours
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
 
-    const recent = await txs.find({
-      created_at: { $gte: twoHoursAgo },
-      $or: [
-        { type: 'deposit', is_bonus: { $ne: true } },
-        { type: 'transfer_in', description: { $regex: /^Received from BIASHARA/i } }
-      ]
-    }).sort({ created_at: -1 }).limit(40).toArray();
+    const recent = await txs.aggregate([
+      {
+        $match: {
+          created_at: { $gte: twoHoursAgo },
+          $or: [
+            { type: 'deposit', is_bonus: { $ne: true } },
+            { type: 'transfer_in', description: { $regex: /^Received from BIASHARA/i } }
+          ]
+        }
+      },
+      { $sort: { created_at: -1 } },
+      { $limit: 20 },
+      {
+        $lookup: {
+          from: 'users',
+          let: { uid: '$user_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } },
+            { $project: { name: 1, role: 1 } }
+          ],
+          as: 'user'
+        }
+      },
+      { $unwind: '$user' },
+      { $match: { 'user.role': { $ne: 'admin' }, 'user.name': { $ne: 'BIASHARA LOANS LIMITED' } } },
+      { $limit: 10 }
+    ]).toArray();
 
-    const items = [];
-    for (const t of recent) {
-      if (items.length >= 10) break;
-      const u = await users.findOne({ _id: new ObjectId(t.user_id) });
-      if (u && u.role !== 'admin' && u.name !== 'BIASHARA LOANS LIMITED') {
-        const parts = (u.name || 'User').split(' ').filter(Boolean);
-        const masked = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
-        items.push({ name: masked, amount: t.amount, at: t.created_at });
-      }
-    }
+    const items = recent.map(t => {
+      const parts = (t.user.name || 'User').split(' ').filter(Boolean);
+      const masked = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+      return { name: masked, amount: t.amount, at: t.created_at };
+    });
+
     res.json({ items });
   } catch (e) {
+    console.error(e);
     res.json({ items: [] });
   }
 });
