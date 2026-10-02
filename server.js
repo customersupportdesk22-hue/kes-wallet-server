@@ -9,13 +9,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ============ DIAGNOSTIC ENDPOINTS (no auth needed) ============
+// ============ DIAGNOSTIC ENDPOINTS ============
 app.get('/api/test-loan', (req, res) => {
-  res.json({ 
-    ok: true, 
-    message: 'Loan endpoint test successful',
-    timestamp: new Date().toISOString()
-  });
+  res.json({ ok: true, message: 'Loan endpoint test successful', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/diagnostic', (req, res) => {
@@ -24,7 +20,8 @@ app.get('/api/diagnostic', (req, res) => {
     deployed_at: new Date().toISOString(),
     has_loan_apply_route: true,
     has_admin_routes: true,
-    version: 'v3-loan-endpoints'
+    has_notifications: true,
+    version: 'v4-notifications'
   });
 });
 
@@ -94,14 +91,29 @@ async function sendPush(phone, title, message) {
   }
 }
 
-async function notify(phone, title, message) {
+// Updated notify — now also saves in-app notification if userId is provided
+async function notify(phone, title, message, userId) {
   await Promise.allSettled([
     sendSMS(phone, message),
     sendPush(phone, title, message)
   ]);
+  
+  if (userId && notifications) {
+    try {
+      await notifications.insertOne({
+        user_id: String(userId),
+        title: title,
+        message: message,
+        read: false,
+        created_at: new Date()
+      });
+    } catch(e) {
+      console.error('Failed to save notification:', e.message);
+    }
+  }
 }
 
-let db, users, txs, loans;
+let db, users, txs, loans, notifications;
 
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI);
@@ -110,9 +122,11 @@ async function connectDB() {
   users = db.collection('users');
   txs = db.collection('transactions');
   loans = db.collection('loans');
+  notifications = db.collection('notifications');
   await users.createIndex({ email: 1 }, { unique: true });
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ referral_code: 1 });
+  await notifications.createIndex({ user_id: 1, created_at: -1 });
   console.log('MongoDB connected');
 }
 
@@ -216,12 +230,13 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`);
+    const newUserId = result.insertedId.toString();
+    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`, newUserId);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
       const referrer = await users.findOne({ referral_code: refCode });
-      if (referrer && referrer._id.toString() !== result.insertedId.toString()) {
+      if (referrer && referrer._id.toString() !== newUserId) {
         await users.updateOne({ _id: referrer._id }, { $inc: { balance: REFERRAL_BONUS } });
         await users.updateOne({ _id: result.insertedId }, { $set: { referred_by: referrer._id.toString() } });
         await txs.insertOne({
@@ -234,12 +249,12 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        notify(referrer.phone, '💰 Referral Bonus!', `You earned KES ${REFERRAL_BONUS} referral bonus.`);
+        notify(referrer.phone, '💰 Referral Bonus!', `You earned KES ${REFERRAL_BONUS} referral bonus.`, referrer._id.toString());
       }
     }
 
     const user = await getUserById(result.insertedId);
-    const token = jwt.sign({ userId: result.insertedId.toString() }, JWT_SECRET, { expiresIn: '90d' });
+    const token = jwt.sign({ userId: newUserId }, JWT_SECRET, { expiresIn: '90d' });
     res.json({ token, user: sanitize(user) });
   } catch (e) {
     console.error(e);
@@ -272,6 +287,70 @@ app.get('/api/me', auth, async (req, res) => {
     res.json({ user: sanitize(user) });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ============ NOTIFICATIONS ============
+
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const list = await notifications
+      .find({ user_id: req.userId })
+      .sort({ created_at: -1 })
+      .limit(50)
+      .toArray();
+    
+    const items = list.map(n => ({
+      id: n._id.toString(),
+      title: n.title,
+      message: n.message,
+      read: n.read || false,
+      created_at: n.created_at
+    }));
+    
+    const unreadCount = items.filter(n => !n.read).length;
+    res.json({ items, unreadCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
+});
+
+app.post('/api/notifications/read', auth, async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'Missing ID' });
+    await notifications.updateOne(
+      { _id: new ObjectId(id), user_id: req.userId },
+      { $set: { read: true } }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to mark as read' });
+  }
+});
+
+app.post('/api/notifications/read-all', auth, async (req, res) => {
+  try {
+    await notifications.updateMany(
+      { user_id: req.userId, read: false },
+      { $set: { read: true } }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to mark all as read' });
+  }
+});
+
+app.delete('/api/notifications/:id', auth, async (req, res) => {
+  try {
+    await notifications.deleteOne({ 
+      _id: new ObjectId(req.params.id), 
+      user_id: req.userId 
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to delete' });
   }
 });
 
@@ -345,7 +424,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification.`);
+    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification.`, req.userId);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance, reference: ref });
@@ -423,9 +502,9 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved.`);
+      notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved.`, recipient._id.toString());
     } else {
-      notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
+      notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`, recipient._id.toString());
     }
 
     const updated = await getUserById(req.userId);
@@ -466,7 +545,7 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ LOAN APPLICATION (robust version) ============
+// ============ LOAN APPLICATION ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
     console.log('=== LOAN APPLY HIT ===');
@@ -476,7 +555,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Robust parsing - strips commas, spaces, "KES" prefix, "months" suffix
     const amt = Number(String(amount || '').replace(/[^\d.]/g, ''));
     const mnths = Number(String(months || '').replace(/[^\d]/g, ''));
     
@@ -518,8 +596,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
 
     console.log('Loan inserted:', result.insertedId.toString());
 
-    // Fire-and-forget — won't crash the request
-    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}. We'll review within 24 hours.`).catch(e => console.error('Notify failed:', e.message));
+    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}. We'll review within 24 hours.`, req.userId).catch(e => console.error('Notify failed:', e.message));
 
     res.json({ ok: true, loanId: result.insertedId.toString() });
   } catch (e) {
@@ -595,7 +672,7 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
-      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`);
+      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`, tx.user_id);
     }
 
     res.json({ ok: true, receipt: finalReceipt });
@@ -656,7 +733,7 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
     if (user) {
-      notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved. Repay KES ${loan.monthly.toLocaleString()}/month for ${loan.months} months.`);
+      notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved. Repay KES ${loan.monthly.toLocaleString()}/month for ${loan.months} months.`, loan.user_id);
     }
 
     res.json({ ok: true });
@@ -701,7 +778,7 @@ app.get('/api/public/activity', async (req, res) => {
 
     const items = recent.map(t => {
       const parts = (t.user.name || 'User').split(' ').filter(Boolean);
-      const masked = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+      const masked = parts[0] + (parts[1] ? ' ' + parts[1][1] + '.' : '');
       return { name: masked, amount: t.amount, at: t.created_at };
     });
 
@@ -712,7 +789,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v3-loan-endpoints' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v4-notifications' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
