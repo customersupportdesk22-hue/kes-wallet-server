@@ -9,6 +9,25 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============ DIAGNOSTIC ENDPOINTS (no auth needed) ============
+app.get('/api/test-loan', (req, res) => {
+  res.json({ 
+    ok: true, 
+    message: 'Loan endpoint test successful',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/diagnostic', (req, res) => {
+  res.json({
+    ok: true,
+    deployed_at: new Date().toISOString(),
+    has_loan_apply_route: true,
+    has_admin_routes: true,
+    version: 'v3-loan-endpoints'
+  });
+});
+
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
@@ -44,9 +63,7 @@ async function sendSMS(phone, message) {
   }
   try {
     const to = '+' + normalizePhone(phone);
-    console.log('Sending SMS to', to);
     const result = await atSms.send({ to: [to], message });
-    console.log('SMS result:', JSON.stringify(result));
     return result;
   } catch(e) {
     console.error('SMS failed:', e.message);
@@ -54,10 +71,7 @@ async function sendSMS(phone, message) {
 }
 
 async function sendPush(phone, title, message) {
-  if (!ONESIGNAL_APP_ID || !ONESIGNAL_REST_KEY) {
-    console.log('Push skipped - OneSignal not configured');
-    return;
-  }
+  if (!ONESIGNAL_APP_ID || !ONESIGNAL_REST_KEY) return;
   try {
     const norm = normalizePhone(phone);
     const res = await fetch('https://onesignal.com/api/v1/notifications', {
@@ -74,9 +88,7 @@ async function sendPush(phone, title, message) {
         contents: { en: message }
       })
     });
-    const data = await res.json();
-    console.log('Push result:', data.id || data.errors || data);
-    return data;
+    return await res.json();
   } catch(e) {
     console.error('Push failed:', e.message);
   }
@@ -204,7 +216,7 @@ app.post('/api/register', async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready. Log in to apply for a loan.`);
+    notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`);
 
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
@@ -222,7 +234,7 @@ app.post('/api/register', async (req, res) => {
           is_bonus: true,
           created_at: new Date(),
         });
-        notify(referrer.phone, '💰 Referral Bonus!', `You earned KES ${REFERRAL_BONUS} referral bonus from ${name.split(' ')[0]}.`);
+        notify(referrer.phone, '💰 Referral Bonus!', `You earned KES ${REFERRAL_BONUS} referral bonus.`);
       }
     }
 
@@ -333,7 +345,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification. Please verify via WhatsApp in the app.`);
+    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification.`);
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance, reference: ref });
@@ -411,7 +423,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
         due_date: dueDate,
       });
 
-      notify(recipient.phone, '🎉 Congratulations Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved. Repay KES ${monthly.toLocaleString()}/month for ${months} months.`);
+      notify(recipient.phone, '🎉 Loan Approved!', `Your loan of KES ${amt.toLocaleString()} is approved.`);
     } else {
       notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`);
     }
@@ -457,19 +469,21 @@ app.get('/api/loans/:id', auth, async (req, res) => {
 // ============ LOAN APPLICATION (robust version) ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
-    console.log('=== LOAN APPLY ===', JSON.stringify(req.body));
+    console.log('=== LOAN APPLY HIT ===');
+    console.log('Body received:', JSON.stringify(req.body));
     
     const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Strip commas, spaces, and any non-numeric characters from amount
+    // Robust parsing - strips commas, spaces, "KES" prefix, "months" suffix
     const amt = Number(String(amount || '').replace(/[^\d.]/g, ''));
-    // Strip anything from months — extract just the number
     const mnths = Number(String(months || '').replace(/[^\d]/g, ''));
     
-    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: ' + amount });
-    if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: ' + months });
+    console.log('Parsed amount:', amt, 'months:', mnths);
+    
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
+    if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
 
     const rate = 10;
     const r = rate / 100 / 12;
@@ -504,8 +518,8 @@ app.post('/api/loans/apply', auth, async (req, res) => {
 
     console.log('Loan inserted:', result.insertedId.toString());
 
-    // Non-blocking notify — won't crash the request
-    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we have received your loan application for KES ${amt.toLocaleString()}. We will review it within 24 hours.`).catch(e => console.error('Notify failed:', e.message));
+    // Fire-and-forget — won't crash the request
+    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}. We'll review within 24 hours.`).catch(e => console.error('Notify failed:', e.message));
 
     res.json({ ok: true, loanId: result.insertedId.toString() });
   } catch (e) {
@@ -581,7 +595,7 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
-      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent to your M-Pesa. Receipt: ${finalReceipt}`);
+      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`);
     }
 
     res.json({ ok: true, receipt: finalReceipt });
@@ -642,7 +656,7 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
     if (user) {
-      notify(user.phone, '🎉 Loan Approved!', `Congratulations! Your loan of KES ${loan.amount.toLocaleString()} has been approved. Repay KES ${loan.monthly.toLocaleString()}/month for ${loan.months} months.`);
+      notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved. Repay KES ${loan.monthly.toLocaleString()}/month for ${loan.months} months.`);
     }
 
     res.json({ ok: true });
@@ -698,7 +712,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v3-loan-endpoints' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
