@@ -327,7 +327,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       user_id: req.userId,
       type: 'withdrawal',
       amount: amt,
-      description: 'Withdrawal to M-Pesa — Pending Verification',
+      description: 'Withdrawal to M-Pesa',
       reference: ref,
       status: 'pending',
       mpesa_receipt: null,
@@ -519,7 +519,11 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     await txs.updateOne(
       { _id: new ObjectId(txId) },
-      { $set: { status: 'completed', mpesa_receipt: finalReceipt } }
+      { $set: { 
+          status: 'completed', 
+          mpesa_receipt: finalReceipt,
+          description: 'Withdrawal to M-Pesa'
+      } }
     );
 
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
