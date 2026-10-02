@@ -454,17 +454,22 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ LOAN APPLICATION ============
+// ============ LOAN APPLICATION (robust version) ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
+    console.log('=== LOAN APPLY ===', JSON.stringify(req.body));
+    
     const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const amt = Number(amount);
-    const mnths = Number(months);
-    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
-    if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months' });
+    // Strip commas, spaces, and any non-numeric characters from amount
+    const amt = Number(String(amount || '').replace(/[^\d.]/g, ''));
+    // Strip anything from months — extract just the number
+    const mnths = Number(String(months || '').replace(/[^\d]/g, ''));
+    
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: ' + amount });
+    if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: ' + months });
 
     const rate = 10;
     const r = rate / 100 / 12;
@@ -497,12 +502,15 @@ app.post('/api/loans/apply', auth, async (req, res) => {
       due_date: dueDate,
     });
 
-    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we have received your loan application for KES ${amt.toLocaleString()}. We will review it within 24 hours.`);
+    console.log('Loan inserted:', result.insertedId.toString());
+
+    // Non-blocking notify — won't crash the request
+    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we have received your loan application for KES ${amt.toLocaleString()}. We will review it within 24 hours.`).catch(e => console.error('Notify failed:', e.message));
 
     res.json({ ok: true, loanId: result.insertedId.toString() });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Loan application failed' });
+    console.error('LOAN APPLY ERROR:', e);
+    res.status(500).json({ error: 'Loan failed: ' + e.message });
   }
 });
 
