@@ -457,6 +457,51 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
+// ============ ADMIN: LIST PENDING WITHDRAWALS ============
+app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const pending = await txs.aggregate([
+      { $match: { type: 'withdrawal', status: 'pending' } },
+      { $sort: { created_at: -1 } },
+      {
+        $lookup: {
+          from: 'users',
+          let: { uid: '$user_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } },
+            { $project: { name: 1, phone: 1, email: 1, balance: 1 } }
+          ],
+          as: 'user'
+        }
+      },
+      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+      { $limit: 100 }
+    ]).toArray();
+
+    const items = pending.map(t => ({
+      id: t._id.toString(),
+      amount: t.amount,
+      reference: t.reference,
+      created_at: t.created_at,
+      description: t.description,
+      user: t.user ? {
+        name: t.user.name,
+        phone: t.user.phone,
+        email: t.user.email,
+        balance: t.user.balance
+      } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown', balance: 0 }
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load pending withdrawals' });
+  }
+});
+
 // ============ ADMIN: APPROVE WITHDRAWAL ============
 app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   try {
