@@ -454,7 +454,7 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ LOAN APPLICATION (from form) ============
+// ============ LOAN APPLICATION ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
     const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
@@ -466,7 +466,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months' });
 
-    // Calculate repayment plan
     const rate = 10;
     const r = rate / 100 / 12;
     let monthly;
@@ -569,11 +568,7 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     await txs.updateOne(
       { _id: new ObjectId(txId) },
-      { $set: { 
-          status: 'completed', 
-          mpesa_receipt: finalReceipt,
-          description: 'Withdrawal to M-Pesa'
-      } }
+      { $set: { status: 'completed', mpesa_receipt: finalReceipt, description: 'Withdrawal to M-Pesa' } }
     );
 
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
@@ -649,7 +644,7 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED (Last 2 Hours, Optimized) ============
+// ============ PUBLIC LIVE PAYOUTS FEED ============
 app.get('/api/public/activity', async (req, res) => {
   try {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
