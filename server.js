@@ -311,7 +311,6 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
   }
 });
 
-// ============ WITHDRAWAL (PENDING VERIFICATION) ============
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
@@ -434,9 +433,7 @@ app.get('/api/lookup/:phone', async (req, res) => {
   } catch (e) {
     res.json({ found: false });
   }
-});
-
-// ============ LOANS ============
+});// ============ LOANS ============
 
 app.get('/api/loans', auth, async (req, res) => {
   try {
@@ -454,6 +451,59 @@ app.get('/api/loans/:id', auth, async (req, res) => {
     res.json({ loan: formatLoan(loan), schedule: buildSchedule(loan) });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ============ LOAN APPLICATION (from form) ============
+app.post('/api/loans/apply', auth, async (req, res) => {
+  try {
+    const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const amt = Number(amount);
+    const mnths = Number(months);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months' });
+
+    // Calculate repayment plan
+    const rate = 10;
+    const r = rate / 100 / 12;
+    let monthly;
+    if (r === 0) monthly = amt / mnths;
+    else { const f = Math.pow(1 + r, mnths); monthly = amt * r * f / (f - 1); }
+    monthly = Math.round(monthly);
+    const total = monthly * mnths;
+
+    const dueDate = new Date();
+    dueDate.setMonth(dueDate.getMonth() + mnths);
+
+    const result = await loans.insertOne({
+      user_id: req.userId,
+      amount: amt,
+      months: mnths,
+      rate,
+      monthly,
+      total,
+      interest: total - amt,
+      paid: 0,
+      status: 'pending',
+      purpose: purpose || 'Business Loan',
+      employment: employment || 'N/A',
+      id_number: idNumber || user.id_number || 'N/A',
+      full_name: fullName || user.name,
+      phone: phone || user.phone,
+      email: email || user.email,
+      created_at: new Date(),
+      due_date: dueDate,
+    });
+
+    notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we have received your loan application for KES ${amt.toLocaleString()}. We will review it within 24 hours.`);
+
+    res.json({ ok: true, loanId: result.insertedId.toString() });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Loan application failed' });
   }
 });
 
@@ -535,6 +585,67 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Approval failed' });
+  }
+});
+
+// ============ ADMIN: LIST PENDING LOANS ============
+app.get('/api/admin/pending-loans', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const pending = await loans.find({ status: 'pending' }).sort({ created_at: -1 }).limit(100).toArray();
+
+    const items = pending.map(l => ({
+      id: l._id.toString(),
+      full_name: l.full_name || 'N/A',
+      phone: l.phone || 'N/A',
+      email: l.email || 'N/A',
+      amount: l.amount,
+      months: l.months,
+      monthly: l.monthly,
+      total: l.total,
+      purpose: l.purpose || 'N/A',
+      employment: l.employment || 'N/A',
+      id_number: l.id_number || 'N/A',
+      created_at: l.created_at,
+      user_id: l.user_id
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load pending loans' });
+  }
+});
+
+// ============ ADMIN: APPROVE LOAN ============
+app.post('/api/admin/approve-loan', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const { loanId } = req.body;
+    if (!loanId) return res.status(400).json({ error: 'Missing loan ID' });
+
+    const loan = await loans.findOne({ _id: new ObjectId(loanId) });
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+    if (loan.status === 'active') return res.status(400).json({ error: 'Already approved' });
+
+    await loans.updateOne(
+      { _id: new ObjectId(loanId) },
+      { $set: { status: 'active', approved_at: new Date() } }
+    );
+
+    const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
+    if (user) {
+      notify(user.phone, '🎉 Loan Approved!', `Congratulations! Your loan of KES ${loan.amount.toLocaleString()} has been approved. Repay KES ${loan.monthly.toLocaleString()}/month for ${loan.months} months.`);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Loan approval failed' });
   }
 });
 
