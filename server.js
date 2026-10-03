@@ -21,7 +21,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_loan_apply_route: true,
     has_admin_routes: true,
     has_notifications: true,
-    version: 'v4-notifications'
+    has_fee_system: true,
+    version: 'v5-fee-system'
   });
 });
 
@@ -91,7 +92,6 @@ async function sendPush(phone, title, message) {
   }
 }
 
-// Updated notify — now also saves in-app notification if userId is provided
 async function notify(phone, title, message, userId) {
   await Promise.allSettled([
     sendSMS(phone, message),
@@ -164,6 +164,15 @@ async function getUserById(id) {
 
 function makeRef() {
   return 'BB' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 90 + 10);
+}
+
+// ===== WITHDRAWAL FEE CALCULATION =====
+// 1.5% fee, minimum KES 400, maximum KES 1,000
+function calculateFee(amount) {
+  const amt = Number(amount) || 0;
+  const rawFee = amt * 0.015;
+  const fee = Math.max(400, Math.min(1000, Math.round(rawFee)));
+  return fee;
 }
 
 function generateReferralCode(name) {
@@ -363,6 +372,7 @@ app.get('/api/wallet/txs', auth, async (req, res) => {
       id: t._id.toString(),
       type: t.type,
       amount: t.amount,
+      fee: t.fee || null,
       description: t.description,
       reference: t.reference,
       status: t.status,
@@ -410,6 +420,10 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
+    // Calculate security fee (not deducted from wallet)
+    const fee = calculateFee(amt);
+
+    // Deduct only the withdrawal amount (fee is paid separately via M-Pesa)
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
 
     const ref = makeRef();
@@ -417,6 +431,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       user_id: req.userId,
       type: 'withdrawal',
       amount: amt,
+      fee: fee,
       description: 'Withdrawal to M-Pesa',
       reference: ref,
       status: 'pending',
@@ -424,17 +439,22 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending verification.`, req.userId);
+    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending. Security fee to pay: KES ${fee.toLocaleString()}.`, req.userId);
 
     const updated = await getUserById(req.userId);
-    res.json({ balance: updated.balance, reference: ref });
+    res.json({ 
+      balance: updated.balance, 
+      reference: ref, 
+      fee: fee,
+      amount: amt,
+      feePayable: fee,
+      message: `Withdrawal of KES ${amt.toLocaleString()} is pending. Pay security fee of KES ${fee.toLocaleString()} to release.`
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Withdrawal failed' });
   }
-});
-
-app.post('/api/wallet/transfer', auth, async (req, res) => {
+});app.post('/api/wallet/transfer', auth, async (req, res) => {
   try {
     const { phone, amount, note } = req.body;
     const amt = Number(amount);
@@ -524,7 +544,9 @@ app.get('/api/lookup/:phone', async (req, res) => {
   } catch (e) {
     res.json({ found: false });
   }
-});// ============ LOANS ============
+});
+
+// ============ LOANS ============
 
 app.get('/api/loans', auth, async (req, res) => {
   try {
@@ -632,6 +654,7 @@ app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
     const items = pending.map(t => ({
       id: t._id.toString(),
       amount: t.amount,
+      fee: t.fee || 0,
       reference: t.reference,
       created_at: t.created_at,
       description: t.description,
@@ -789,7 +812,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v4-notifications' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v5-fee-system' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
