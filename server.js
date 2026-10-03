@@ -23,7 +23,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_notifications: true,
     has_fee_system: true,
     has_tiered_fees: true,
-    version: 'v6-tiered-fees'
+    has_clean_payouts: true,
+    version: 'v7-clean-payouts'
   });
 });
 
@@ -777,7 +778,11 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED ============
+// ============ PUBLIC LIVE PAYOUTS FEED (CLEAN VERSION) ============
+// Only shows REAL completed payouts:
+//   - Completed withdrawals (customer received money via M-Pesa)
+//   - Completed deposits (customer funded their wallet)
+// Hides: pending withdrawals, internal transfers, unapproved loans
 app.get('/api/public/activity', async (req, res) => {
   try {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
@@ -786,9 +791,12 @@ app.get('/api/public/activity', async (req, res) => {
       {
         $match: {
           created_at: { $gte: twoHoursAgo },
+          status: 'completed',
           $or: [
-            { type: 'deposit', is_bonus: { $ne: true } },
-            { type: 'transfer_in', description: { $regex: /^Received from BIASHARA/i } }
+            // Real completed withdrawals (with M-Pesa receipt)
+            { type: 'withdrawal', mpesa_receipt: { $exists: true, $ne: null } },
+            // Real deposits (not referral bonuses)
+            { type: 'deposit', is_bonus: { $ne: true } }
           ]
         }
       },
@@ -812,8 +820,8 @@ app.get('/api/public/activity', async (req, res) => {
 
     const items = recent.map(t => {
       const parts = (t.user.name || 'User').split(' ').filter(Boolean);
-      const masked = parts[0] + (parts[1] ? ' ' + parts[1][1] + '.' : '');
-      return { name: masked, amount: t.amount, at: t.created_at };
+      const masked = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+      return { name: masked, amount: t.amount, at: t.created_at, type: t.type };
     });
 
     res.json({ items });
@@ -823,7 +831,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v6-tiered-fees' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v7-clean-payouts' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
