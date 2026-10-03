@@ -7,7 +7,10 @@ const AfricasTalking = require('africastalking');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// IMPORTANT: Increase payload limit for KYC base64 images (up to 15MB per request)
+app.use(express.json({ limit: '15mb' }));
+
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
 
 // ============ DIAGNOSTIC ENDPOINTS ============
 app.get('/api/test-loan', (req, res) => {
@@ -24,7 +27,9 @@ app.get('/api/diagnostic', (req, res) => {
     has_fee_system: true,
     has_tiered_fees: true,
     has_clean_payouts: true,
-    version: 'v7-clean-payouts'
+    has_kyc: true,
+    has_imgbb: !!IMGBB_API_KEY,
+    version: 'v8-kyc'
   });
 });
 
@@ -33,6 +38,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
 const REFERRAL_BONUS = 50;
+const UNVERIFIED_LOAN_LIMIT = 5000;
 
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
 const AT_API_KEY = process.env.AT_API_KEY || '';
@@ -115,7 +121,28 @@ async function notify(phone, title, message, userId) {
   }
 }
 
-let db, users, txs, loans, notifications;
+// ===== ImgBB Upload Helper =====
+async function uploadToImgbb(base64Data) {
+  if (!IMGBB_API_KEY) throw new Error('ImgBB not configured');
+  
+  // Strip data:image/...;base64, prefix if present
+  const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
+  
+  const formData = new URLSearchParams();
+  formData.append('key', IMGBB_API_KEY);
+  formData.append('image', cleanBase64);
+  
+  const res = await fetch('https://api.imgbb.com/1/upload', {
+    method: 'POST',
+    body: formData
+  });
+  
+  const data = await res.json();
+  if (!data.success) throw new Error(data.error?.message || 'ImgBB upload failed');
+  return data.data.url;
+}
+
+let db, users, txs, loans, notifications, kyc;
 
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI);
@@ -125,10 +152,13 @@ async function connectDB() {
   txs = db.collection('transactions');
   loans = db.collection('loans');
   notifications = db.collection('notifications');
+  kyc = db.collection('kyc');
   await users.createIndex({ email: 1 }, { unique: true });
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ referral_code: 1 });
   await notifications.createIndex({ user_id: 1, created_at: -1 });
+  await kyc.createIndex({ user_id: 1 });
+  await kyc.createIndex({ status: 1, created_at: -1 });
   console.log('MongoDB connected');
 }
 
@@ -144,6 +174,7 @@ function sanitize(u) {
     status: u.status || 'active',
     id_number: u.id_number || null,
     referral_code: u.referral_code || null,
+    kyc_status: u.kyc_status || 'unverified',
   };
 }
 
@@ -169,16 +200,8 @@ function makeRef() {
 }
 
 // ===== TIERED WITHDRAWAL FEE =====
-//   5K-10K   → KES 400
-//   11K-15K  → KES 600
-//   16K-20K  → KES 800
-//   21K-25K  → KES 1,000
-//   26K-50K  → KES 1,500
-//   51K-100K → KES 2,000
-//   100K+    → KES 3,000
 function calculateFee(amount) {
   const amt = Number(amount) || 0;
-  
   if (amt < 5000) return 400;
   if (amt <= 10000) return 400;
   if (amt <= 15000) return 600;
@@ -250,6 +273,7 @@ app.post('/api/register', async (req, res) => {
       id_number: idNumber || null,
       referral_code: userCode,
       referred_by: null,
+      kyc_status: 'unverified',
       created_at: new Date(),
     });
 
@@ -310,6 +334,201 @@ app.get('/api/me', auth, async (req, res) => {
     res.json({ user: sanitize(user) });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// ============ KYC ============
+
+// Submit KYC (customer uploads ID + selfie)
+app.post('/api/kyc/submit', auth, async (req, res) => {
+  try {
+    const { idPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
+    if (!idPhoto || !selfiePhoto) {
+      return res.status(400).json({ error: 'Both ID photo and selfie are required' });
+    }
+    if (!fullName || !idNumber) {
+      return res.status(400).json({ error: 'Full name and ID number are required' });
+    }
+
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (user.kyc_status === 'verified') {
+      return res.status(400).json({ error: 'Your KYC is already verified' });
+    }
+
+    // Upload both images to ImgBB
+    console.log('Uploading ID photo to ImgBB...');
+    const idUrl = await uploadToImgbb(idPhoto);
+    console.log('ID uploaded:', idUrl);
+
+    console.log('Uploading selfie to ImgBB...');
+    const selfieUrl = await uploadToImgbb(selfiePhoto);
+    console.log('Selfie uploaded:', selfieUrl);
+
+    // Save KYC submission
+    const submission = {
+      user_id: req.userId,
+      full_name: fullName,
+      id_number: idNumber,
+      dob: dob || null,
+      id_photo_url: idUrl,
+      selfie_photo_url: selfieUrl,
+      status: 'pending',
+      submitted_at: new Date(),
+      reviewed_at: null,
+      reviewed_by: null,
+      rejection_reason: null,
+    };
+
+    // Delete any previous pending submission
+    await kyc.deleteMany({ user_id: req.userId, status: 'pending' });
+
+    const result = await kyc.insertOne(submission);
+
+    // Update user's kyc_status
+    await users.updateOne(
+      { _id: new ObjectId(req.userId) },
+      { $set: { kyc_status: 'pending', kyc_submitted_at: new Date() } }
+    );
+
+    // Notify user
+    notify(user.phone, '📋 KYC Received', `Your identity verification has been received. We'll review it within 24 hours.`, req.userId);
+
+    res.json({
+      ok: true,
+      submissionId: result.insertedId.toString(),
+      status: 'pending',
+      message: 'KYC submitted successfully. We will review within 24 hours.'
+    });
+  } catch (e) {
+    console.error('KYC submit error:', e);
+    res.status(500).json({ error: 'KYC submission failed: ' + e.message });
+  }
+});
+
+// Get current user's KYC status + submission
+app.get('/api/kyc/status', auth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const submission = await kyc.findOne(
+      { user_id: req.userId },
+      { sort: { submitted_at: -1 } }
+    );
+
+    res.json({
+      kyc_status: user.kyc_status || 'unverified',
+      submission: submission ? {
+        id: submission._id.toString(),
+        status: submission.status,
+        full_name: submission.full_name,
+        id_number: submission.id_number,
+        submitted_at: submission.submitted_at,
+        reviewed_at: submission.reviewed_at,
+        rejection_reason: submission.rejection_reason || null,
+      } : null,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// Admin: list pending KYC submissions
+app.get('/api/admin/pending-kyc', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const pending = await kyc.aggregate([
+      { $match: { status: 'pending' } },
+      { $sort: { submitted_at: -1 } },
+      {
+        $lookup: {
+          from: 'users',
+          let: { uid: '$user_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } },
+            { $project: { name: 1, phone: 1, email: 1, kyc_status: 1 } }
+          ],
+          as: 'user'
+        }
+      },
+      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+      { $limit: 100 }
+    ]).toArray();
+
+    const items = pending.map(k => ({
+      id: k._id.toString(),
+      user_id: k.user_id,
+      full_name: k.full_name,
+      id_number: k.id_number,
+      dob: k.dob,
+      id_photo_url: k.id_photo_url,
+      selfie_photo_url: k.selfie_photo_url,
+      submitted_at: k.submitted_at,
+      user: k.user ? {
+        name: k.user.name,
+        phone: k.user.phone,
+        email: k.user.email,
+      } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown' }
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load pending KYC' });
+  }
+});
+
+// Admin: approve or reject KYC
+app.post('/api/admin/approve-kyc', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const { kycId, action, reason } = req.body;
+    if (!kycId || !action) return res.status(400).json({ error: 'Missing kycId or action' });
+    if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+
+    const submission = await kyc.findOne({ _id: new ObjectId(kycId) });
+    if (!submission) return res.status(404).json({ error: 'KYC not found' });
+    if (submission.status !== 'pending') return res.status(400).json({ error: 'Already reviewed' });
+
+    const newStatus = action === 'approve' ? 'verified' : 'rejected';
+
+    await kyc.updateOne(
+      { _id: new ObjectId(kycId) },
+      {
+        $set: {
+          status: newStatus,
+          reviewed_at: new Date(),
+          reviewed_by: admin._id.toString(),
+          rejection_reason: action === 'reject' ? (reason || 'Documents not clear') : null,
+        }
+      }
+    );
+
+    await users.updateOne(
+      { _id: new ObjectId(submission.user_id) },
+      { $set: { kyc_status: newStatus, kyc_verified_at: action === 'approve' ? new Date() : null } }
+    );
+
+    const user = await users.findOne({ _id: new ObjectId(submission.user_id) });
+    if (user) {
+      if (action === 'approve') {
+        notify(user.phone, '✅ KYC Approved!', `Your identity has been verified. You can now apply for loans up to KES 500,000.`, submission.user_id);
+      } else {
+        notify(user.phone, '❌ KYC Rejected', `Your KYC was rejected. Reason: ${reason || 'Documents not clear'}. Please resubmit.`, submission.user_id);
+      }
+    }
+
+    res.json({ ok: true, status: newStatus });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'KYC review failed' });
   }
 });
 
@@ -375,9 +594,7 @@ app.delete('/api/notifications/:id', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Failed to delete' });
   }
-});
-
-// ============ WALLET ============
+});// ============ WALLET ============
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
   try {
@@ -466,7 +683,9 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Withdrawal failed' });
   }
-});app.post('/api/wallet/transfer', auth, async (req, res) => {
+});
+
+app.post('/api/wallet/transfer', auth, async (req, res) => {
   try {
     const { phone, amount, note } = req.body;
     const amt = Number(amount);
@@ -579,7 +798,7 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ LOAN APPLICATION ============
+// ============ LOAN APPLICATION (with KYC check) ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
     console.log('=== LOAN APPLY HIT ===');
@@ -596,6 +815,17 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
+
+    // KYC CHECK: Unverified users can only borrow up to KES 5,000
+    const kycStatus = user.kyc_status || 'unverified';
+    if (amt > UNVERIFIED_LOAN_LIMIT && kycStatus !== 'verified') {
+      return res.status(403).json({
+        error: `Identity verification required. Unverified users can borrow up to KES ${UNVERIFIED_LOAN_LIMIT.toLocaleString()}. Please complete KYC to access larger loans.`,
+        kyc_required: true,
+        kyc_status: kycStatus,
+        max_unverified: UNVERIFIED_LOAN_LIMIT
+      });
+    }
 
     const rate = 10;
     const r = rate / 100 / 12;
@@ -624,6 +854,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
       full_name: fullName || user.name,
       phone: phone || user.phone,
       email: email || user.email,
+      kyc_status_at_apply: kycStatus,
       created_at: new Date(),
       due_date: dueDate,
     });
@@ -654,7 +885,7 @@ app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
           let: { uid: '$user_id' },
           pipeline: [
             { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } },
-            { $project: { name: 1, phone: 1, email: 1, balance: 1 } }
+            { $project: { name: 1, phone: 1, email: 1, balance: 1, kyc_status: 1 } }
           ],
           as: 'user'
         }
@@ -674,8 +905,9 @@ app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
         name: t.user.name,
         phone: t.user.phone,
         email: t.user.email,
-        balance: t.user.balance
-      } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown', balance: 0 }
+        balance: t.user.balance,
+        kyc_status: t.user.kyc_status || 'unverified'
+      } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown', balance: 0, kyc_status: 'unverified' }
     }));
 
     res.json({ items });
@@ -737,6 +969,7 @@ app.get('/api/admin/pending-loans', auth, async (req, res) => {
       purpose: l.purpose || 'N/A',
       employment: l.employment || 'N/A',
       id_number: l.id_number || 'N/A',
+      kyc_status: l.kyc_status_at_apply || 'unverified',
       created_at: l.created_at,
       user_id: l.user_id
     }));
@@ -778,11 +1011,7 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
   }
 });
 
-// ============ PUBLIC LIVE PAYOUTS FEED (CLEAN VERSION) ============
-// Only shows REAL completed payouts:
-//   - Completed withdrawals (customer received money via M-Pesa)
-//   - Completed deposits (customer funded their wallet)
-// Hides: pending withdrawals, internal transfers, unapproved loans
+// ============ PUBLIC LIVE PAYOUTS FEED ============
 app.get('/api/public/activity', async (req, res) => {
   try {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
@@ -793,9 +1022,7 @@ app.get('/api/public/activity', async (req, res) => {
           created_at: { $gte: twoHoursAgo },
           status: 'completed',
           $or: [
-            // Real completed withdrawals (with M-Pesa receipt)
             { type: 'withdrawal', mpesa_receipt: { $exists: true, $ne: null } },
-            // Real deposits (not referral bonuses)
             { type: 'deposit', is_bonus: { $ne: true } }
           ]
         }
@@ -831,7 +1058,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v7-clean-payouts' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v8-kyc' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
