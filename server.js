@@ -22,7 +22,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_admin_routes: true,
     has_notifications: true,
     has_fee_system: true,
-    version: 'v5-fee-system'
+    has_tiered_fees: true,
+    version: 'v6-tiered-fees'
   });
 });
 
@@ -166,13 +167,25 @@ function makeRef() {
   return 'BB' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 90 + 10);
 }
 
-// ===== WITHDRAWAL FEE CALCULATION =====
-// 1.5% fee, minimum KES 400, maximum KES 1,000
+// ===== TIERED WITHDRAWAL FEE =====
+//   5K-10K   → KES 400
+//   11K-15K  → KES 600
+//   16K-20K  → KES 800
+//   21K-25K  → KES 1,000
+//   26K-50K  → KES 1,500
+//   51K-100K → KES 2,000
+//   100K+    → KES 3,000
 function calculateFee(amount) {
   const amt = Number(amount) || 0;
-  const rawFee = amt * 0.015;
-  const fee = Math.max(400, Math.min(1000, Math.round(rawFee)));
-  return fee;
+  
+  if (amt < 5000) return 400;
+  if (amt <= 10000) return 400;
+  if (amt <= 15000) return 600;
+  if (amt <= 20000) return 800;
+  if (amt <= 25000) return 1000;
+  if (amt <= 50000) return 1500;
+  if (amt <= 100000) return 2000;
+  return 3000;
 }
 
 function generateReferralCode(name) {
@@ -420,10 +433,8 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // Calculate security fee (not deducted from wallet)
     const fee = calculateFee(amt);
 
-    // Deduct only the withdrawal amount (fee is paid separately via M-Pesa)
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
 
     const ref = makeRef();
@@ -654,7 +665,7 @@ app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
     const items = pending.map(t => ({
       id: t._id.toString(),
       amount: t.amount,
-      fee: t.fee || 0,
+      fee: t.fee || calculateFee(t.amount),
       reference: t.reference,
       created_at: t.created_at,
       description: t.description,
@@ -812,7 +823,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v5-fee-system' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v6-tiered-fees' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
