@@ -32,7 +32,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_clean_payouts: true,
     has_kyc: true,
     has_cloudinary: !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY,
-    version: 'v9-cloudinary'
+    has_cleanup_tools: true,
+    version: 'v10-cleanup-tools'
   });
 });
 
@@ -124,42 +125,67 @@ async function notify(phone, title, message, userId) {
   }
 }
 
-// ===== Cloudinary Upload Helper (using REST API) =====
+// ===== Cloudinary Upload Helper (REST API) =====
 async function uploadToCloudinary(base64Data) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     throw new Error('Cloudinary not configured');
   }
-  
   const timestamp = Math.floor(Date.now() / 1000);
   const folder = 'biashara-kyc';
-  
-  // Build signature (SHA1 of params + secret)
   const paramsToSign = `folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
   const signature = crypto.createHash('sha1').update(paramsToSign).digest('hex');
-  
-  // Prepare form data
   const formData = new URLSearchParams();
   formData.append('file', base64Data);
   formData.append('api_key', CLOUDINARY_API_KEY);
   formData.append('timestamp', timestamp);
   formData.append('folder', folder);
   formData.append('signature', signature);
-  
-  // Upload
   const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
-  const res = await fetch(url, {
-    method: 'POST',
-    body: formData
-  });
-  
+  const res = await fetch(url, { method: 'POST', body: formData });
   const data = await res.json();
-  
   if (!data.secure_url) {
     console.error('Cloudinary error:', data);
     throw new Error(data.error?.message || 'Cloudinary upload failed');
   }
-  
   return data.secure_url;
+}
+
+// ===== Cloudinary Delete Helper =====
+async function deleteFromCloudinary(imageUrl) {
+  try {
+    if (!imageUrl || !CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+      return false;
+    }
+    const uploadMarker = '/image/upload/';
+    const idx = imageUrl.indexOf(uploadMarker);
+    if (idx === -1) return false;
+    let publicId = imageUrl.substring(idx + uploadMarker.length);
+    if (publicId.startsWith('v')) {
+      const slashIdx = publicId.indexOf('/');
+      if (slashIdx !== -1) publicId = publicId.substring(slashIdx + 1);
+    }
+    publicId = publicId.replace(/\.[^/.]+$/, '');
+    const timestamp = Math.floor(Date.now() / 1000);
+    const paramsToSign = `public_id=${publicId}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
+    const signature = crypto.createHash('sha1').update(paramsToSign).digest('hex');
+    const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/destroy`;
+    const formData = new URLSearchParams();
+    formData.append('public_id', publicId);
+    formData.append('api_key', CLOUDINARY_API_KEY);
+    formData.append('timestamp', timestamp);
+    formData.append('signature', signature);
+    const res = await fetch(url, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.result === 'ok') {
+      console.log('✅ Cloudinary deleted:', publicId);
+      return true;
+    }
+    console.log('⚠️ Cloudinary delete failed:', data);
+    return false;
+  } catch(e) {
+    console.error('Delete Cloudinary error:', e.message);
+    return false;
+  }
 }
 
 let db, users, txs, loans, notifications, kyc;
@@ -540,9 +566,7 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'KYC review failed' });
   }
-});
-
-// ============ NOTIFICATIONS ============
+});// ============ NOTIFICATIONS ============
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -604,7 +628,9 @@ app.delete('/api/notifications/:id', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Failed to delete' });
   }
-});// ============ WALLET ============
+});
+
+// ============ WALLET ============
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
   try {
@@ -811,7 +837,6 @@ app.get('/api/loans/:id', auth, async (req, res) => {
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
     console.log('=== LOAN APPLY HIT ===');
-    console.log('Body received:', JSON.stringify(req.body));
     
     const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
     const user = await getUserById(req.userId);
@@ -819,8 +844,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
 
     const amt = Number(String(amount || '').replace(/[^\d.]/g, ''));
     const mnths = Number(String(months || '').replace(/[^\d]/g, ''));
-    
-    console.log('Parsed amount:', amt, 'months:', mnths);
     
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
@@ -868,8 +891,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
       due_date: dueDate,
     });
 
-    console.log('Loan inserted:', result.insertedId.toString());
-
     notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}. We'll review within 24 hours.`, req.userId).catch(e => console.error('Notify failed:', e.message));
 
     res.json({ ok: true, loanId: result.insertedId.toString() });
@@ -877,9 +898,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     console.error('LOAN APPLY ERROR:', e);
     res.status(500).json({ error: 'Loan failed: ' + e.message });
   }
-});
-
-// ============ ADMIN: LIST PENDING WITHDRAWALS ============
+});// ============ ADMIN: LIST PENDING WITHDRAWALS ============
 app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1067,7 +1086,162 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v9-cloudinary' }));
+// ============ ADMIN: CLEANUP & STATS ============
+
+app.get('/api/admin/storage-stats', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const userCount = await users.countDocuments({});
+    const txCount = await txs.countDocuments({});
+    const loanCount = await loans.countDocuments({});
+    const notifCount = await notifications.countDocuments({});
+    const kycCount = await kyc.countDocuments({});
+    const kycWithPhotos = await kyc.countDocuments({ 
+      $or: [
+        { id_photo_url: { $ne: null } },
+        { selfie_photo_url: { $ne: null } }
+      ]
+    });
+
+    res.json({
+      users: userCount,
+      transactions: txCount,
+      loans: loanCount,
+      notifications: notifCount,
+      kyc: kycCount,
+      kyc_with_photos: kycWithPhotos,
+      estimated_size_mb: Math.round((userCount * 1 + txCount * 1 + loanCount * 2 + notifCount * 0.5 + kycCount * 1) / 1024)
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const days = Number(req.body.days) || 90;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const targets = await kyc.find({
+      status: { $in: ['verified', 'rejected'] },
+      reviewed_at: { $lt: cutoff },
+      $or: [
+        { id_photo_url: { $ne: null } },
+        { selfie_photo_url: { $ne: null } }
+      ]
+    }).limit(100).toArray();
+
+    let cleaned = 0;
+    for (const sub of targets) {
+      try {
+        if (sub.id_photo_url) await deleteFromCloudinary(sub.id_photo_url);
+        if (sub.selfie_photo_url) await deleteFromCloudinary(sub.selfie_photo_url);
+        await kyc.updateOne(
+          { _id: sub._id },
+          { $set: { id_photo_url: null, selfie_photo_url: null, photos_cleaned_at: new Date() } }
+        );
+        cleaned++;
+      } catch(e) {
+        console.error('Cleanup single error:', e.message);
+      }
+    }
+
+    res.json({ ok: true, cleaned: cleaned, total_found: targets.length, days: days });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
+app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const days = Number(req.body.days) || 30;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const result = await notifications.deleteMany({
+      created_at: { $lt: cutoff }
+    });
+
+    res.json({ ok: true, deleted: result.deletedCount, days: days });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
+app.delete('/api/admin/kyc/:id', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const record = await kyc.findOne({ _id: new ObjectId(req.params.id) });
+    if (!record) return res.status(404).json({ error: 'Not found' });
+
+    if (record.id_photo_url) await deleteFromCloudinary(record.id_photo_url);
+    if (record.selfie_photo_url) await deleteFromCloudinary(record.selfie_photo_url);
+
+    await kyc.deleteOne({ _id: new ObjectId(req.params.id) });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+app.delete('/api/admin/tx/:id', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    await txs.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+app.delete('/api/admin/user/:id', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const userId = req.params.id;
+
+    const target = await users.findOne({ _id: new ObjectId(userId) });
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.role === 'admin') return res.status(400).json({ error: 'Cannot delete admin account' });
+
+    const userKyc = await kyc.find({ user_id: userId }).toArray();
+    for (const k of userKyc) {
+      if (k.id_photo_url) await deleteFromCloudinary(k.id_photo_url);
+      if (k.selfie_photo_url) await deleteFromCloudinary(k.selfie_photo_url);
+    }
+
+    await kyc.deleteMany({ user_id: userId });
+    await notifications.deleteMany({ user_id: userId });
+    await loans.deleteMany({ user_id: userId });
+    await txs.deleteMany({ user_id: userId });
+    await users.deleteOne({ _id: new ObjectId(userId) });
+
+    res.json({ ok: true, deleted_user: target.name, deleted_kyc: userKyc.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v10-cleanup-tools' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
