@@ -10,12 +10,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-// ===== Cloudinary Config =====
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
 
-// ============ DIAGNOSTIC ENDPOINTS ============
 app.get('/api/test-loan', (req, res) => {
   res.json({ ok: true, message: 'Loan endpoint test successful', timestamp: new Date().toISOString() });
 });
@@ -33,7 +31,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_kyc: true,
     has_cloudinary: !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY,
     has_cleanup_tools: true,
-    version: 'v10-cleanup-tools'
+    has_pwa_tracking: true,
+    version: 'v11-pwa-tracking'
   });
 });
 
@@ -125,7 +124,6 @@ async function notify(phone, title, message, userId) {
   }
 }
 
-// ===== Cloudinary Upload Helper (REST API) =====
 async function uploadToCloudinary(base64Data) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     throw new Error('Cloudinary not configured');
@@ -150,7 +148,6 @@ async function uploadToCloudinary(base64Data) {
   return data.secure_url;
 }
 
-// ===== Cloudinary Delete Helper =====
 async function deleteFromCloudinary(imageUrl) {
   try {
     if (!imageUrl || !CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
@@ -221,6 +218,7 @@ function sanitize(u) {
     id_number: u.id_number || null,
     referral_code: u.referral_code || null,
     kyc_status: u.kyc_status || 'unverified',
+    pwa_installed: u.pwa_installed || false,
   };
 }
 
@@ -319,6 +317,7 @@ app.post('/api/register', async (req, res) => {
       referral_code: userCode,
       referred_by: null,
       kyc_status: 'unverified',
+      pwa_installed: false,
       created_at: new Date(),
     });
 
@@ -402,11 +401,9 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     }
 
     console.log('=== KYC SUBMIT ===');
-    console.log('Uploading ID photo to Cloudinary...');
     const idUrl = await uploadToCloudinary(idPhoto);
     console.log('ID uploaded:', idUrl);
 
-    console.log('Uploading selfie to Cloudinary...');
     const selfieUrl = await uploadToCloudinary(selfiePhoto);
     console.log('Selfie uploaded:', selfieUrl);
 
@@ -848,7 +845,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
 
-    // KYC CHECK
     const kycStatus = user.kyc_status || 'unverified';
     if (amt > UNVERIFIED_LOAN_LIMIT && kycStatus !== 'verified') {
       return res.status(403).json({
@@ -1241,7 +1237,72 @@ app.delete('/api/admin/user/:id', auth, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v10-cleanup-tools' }));
+// ============ PWA INSTALL TRACKING ============
+
+app.post('/api/pwa/installed', auth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user.pwa_installed) {
+      await users.updateOne(
+        { _id: new ObjectId(req.userId) },
+        { 
+          $set: { 
+            pwa_installed: true,
+            pwa_installed_at: new Date(),
+            pwa_user_agent: String(req.headers['user-agent'] || '').substring(0, 200)
+          }
+        }
+      );
+      console.log('📱 PWA install tracked:', user.phone);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.get('/api/admin/pwa-installs', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const installed = await users.find({
+      pwa_installed: true,
+      role: { $ne: 'admin' }
+    }).sort({ pwa_installed_at: -1 }).limit(200).toArray();
+
+    const totalUsers = await users.countDocuments({ role: { $ne: 'admin' } });
+    const totalInstalls = await users.countDocuments({ pwa_installed: true, role: { $ne: 'admin' } });
+
+    const items = installed.map(u => ({
+      id: u._id.toString(),
+      name: u.name,
+      phone: u.phone,
+      email: u.email,
+      kyc_status: u.kyc_status || 'unverified',
+      installed_at: u.pwa_installed_at,
+      user_agent: u.pwa_user_agent || null
+    }));
+
+    res.json({
+      items,
+      total_users: totalUsers,
+      total_installs: totalInstalls,
+      install_rate: totalUsers > 0 ? Math.round((totalInstalls / totalUsers) * 100) : 0
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load installs' });
+  }
+});
+
+// ============ STARTUP ============
+
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v11-pwa-tracking' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
