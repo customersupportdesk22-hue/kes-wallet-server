@@ -2,15 +2,18 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 const AfricasTalking = require('africastalking');
 
 const app = express();
 app.use(cors());
-// IMPORTANT: Increase payload limit for KYC base64 images (up to 15MB per request)
 app.use(express.json({ limit: '15mb' }));
 
-const IMGBB_API_KEY = process.env.IMGBB_API_KEY || '';
+// ===== Cloudinary Config =====
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
 
 // ============ DIAGNOSTIC ENDPOINTS ============
 app.get('/api/test-loan', (req, res) => {
@@ -28,8 +31,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_tiered_fees: true,
     has_clean_payouts: true,
     has_kyc: true,
-    has_imgbb: !!IMGBB_API_KEY,
-    version: 'v8-kyc'
+    has_cloudinary: !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY,
+    version: 'v9-cloudinary'
   });
 });
 
@@ -121,25 +124,42 @@ async function notify(phone, title, message, userId) {
   }
 }
 
-// ===== ImgBB Upload Helper =====
-async function uploadToImgbb(base64Data) {
-  if (!IMGBB_API_KEY) throw new Error('ImgBB not configured');
+// ===== Cloudinary Upload Helper (using REST API) =====
+async function uploadToCloudinary(base64Data) {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    throw new Error('Cloudinary not configured');
+  }
   
-  // Strip data:image/...;base64, prefix if present
-  const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = 'biashara-kyc';
   
+  // Build signature (SHA1 of params + secret)
+  const paramsToSign = `folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
+  const signature = crypto.createHash('sha1').update(paramsToSign).digest('hex');
+  
+  // Prepare form data
   const formData = new URLSearchParams();
-  formData.append('key', IMGBB_API_KEY);
-  formData.append('image', cleanBase64);
+  formData.append('file', base64Data);
+  formData.append('api_key', CLOUDINARY_API_KEY);
+  formData.append('timestamp', timestamp);
+  formData.append('folder', folder);
+  formData.append('signature', signature);
   
-  const res = await fetch('https://api.imgbb.com/1/upload', {
+  // Upload
+  const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+  const res = await fetch(url, {
     method: 'POST',
     body: formData
   });
   
   const data = await res.json();
-  if (!data.success) throw new Error(data.error?.message || 'ImgBB upload failed');
-  return data.data.url;
+  
+  if (!data.secure_url) {
+    console.error('Cloudinary error:', data);
+    throw new Error(data.error?.message || 'Cloudinary upload failed');
+  }
+  
+  return data.secure_url;
 }
 
 let db, users, txs, loans, notifications, kyc;
@@ -199,7 +219,6 @@ function makeRef() {
   return 'BB' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 90 + 10);
 }
 
-// ===== TIERED WITHDRAWAL FEE =====
 function calculateFee(amount) {
   const amt = Number(amount) || 0;
   if (amt < 5000) return 400;
@@ -339,7 +358,6 @@ app.get('/api/me', auth, async (req, res) => {
 
 // ============ KYC ============
 
-// Submit KYC (customer uploads ID + selfie)
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
     const { idPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
@@ -357,16 +375,15 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
       return res.status(400).json({ error: 'Your KYC is already verified' });
     }
 
-    // Upload both images to ImgBB
-    console.log('Uploading ID photo to ImgBB...');
-    const idUrl = await uploadToImgbb(idPhoto);
+    console.log('=== KYC SUBMIT ===');
+    console.log('Uploading ID photo to Cloudinary...');
+    const idUrl = await uploadToCloudinary(idPhoto);
     console.log('ID uploaded:', idUrl);
 
-    console.log('Uploading selfie to ImgBB...');
-    const selfieUrl = await uploadToImgbb(selfiePhoto);
+    console.log('Uploading selfie to Cloudinary...');
+    const selfieUrl = await uploadToCloudinary(selfiePhoto);
     console.log('Selfie uploaded:', selfieUrl);
 
-    // Save KYC submission
     const submission = {
       user_id: req.userId,
       full_name: fullName,
@@ -381,18 +398,14 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
       rejection_reason: null,
     };
 
-    // Delete any previous pending submission
     await kyc.deleteMany({ user_id: req.userId, status: 'pending' });
-
     const result = await kyc.insertOne(submission);
 
-    // Update user's kyc_status
     await users.updateOne(
       { _id: new ObjectId(req.userId) },
       { $set: { kyc_status: 'pending', kyc_submitted_at: new Date() } }
     );
 
-    // Notify user
     notify(user.phone, '📋 KYC Received', `Your identity verification has been received. We'll review it within 24 hours.`, req.userId);
 
     res.json({
@@ -407,7 +420,6 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
   }
 });
 
-// Get current user's KYC status + submission
 app.get('/api/kyc/status', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
@@ -436,7 +448,6 @@ app.get('/api/kyc/status', auth, async (req, res) => {
   }
 });
 
-// Admin: list pending KYC submissions
 app.get('/api/admin/pending-kyc', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -483,7 +494,6 @@ app.get('/api/admin/pending-kyc', auth, async (req, res) => {
   }
 });
 
-// Admin: approve or reject KYC
 app.post('/api/admin/approve-kyc', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -798,7 +808,6 @@ app.get('/api/loans/:id', auth, async (req, res) => {
   }
 });
 
-// ============ LOAN APPLICATION (with KYC check) ============
 app.post('/api/loans/apply', auth, async (req, res) => {
   try {
     console.log('=== LOAN APPLY HIT ===');
@@ -816,7 +825,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
 
-    // KYC CHECK: Unverified users can only borrow up to KES 5,000
+    // KYC CHECK
     const kycStatus = user.kyc_status || 'unverified';
     if (amt > UNVERIFIED_LOAN_LIMIT && kycStatus !== 'verified') {
       return res.status(403).json({
@@ -1058,7 +1067,7 @@ app.get('/api/public/activity', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v8-kyc' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v9-cloudinary' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
