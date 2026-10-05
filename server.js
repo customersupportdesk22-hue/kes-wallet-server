@@ -201,13 +201,17 @@ async function initiateHashPayStk({ phone, amount, reference, description }) {
     phone: normalizePhone(phone),
     amount: Number(amount),
     reference: String(reference || ('HP' + Date.now())),
-    description: description || 'M-Pesa Verification Fee'
+    description: description || 'M-Pesa Verification Fee',
+    // ADDED: The URL where M-Pesa should send the response. Must be your live Render URL.
+    callback_url: 'https://kes-wallet-server.onrender.com/api/hashpay/webhook' 
   };
   
   console.log('=== HASHPAY STK PUSH ===');
   console.log('Phone:', payload.phone);
   console.log('Amount:', payload.amount);
   console.log('Reference:', payload.reference);
+  // UPDATED: This logs the entire JSON object so we can see the exact keys in Render logs
+  console.log('FULL PAYLOAD:', JSON.stringify(payload, null, 2));
   
   const res = await fetch('https://api.hashback.co.ke/initiatestk', {
     method: 'POST',
@@ -219,9 +223,7 @@ async function initiateHashPayStk({ phone, amount, reference, description }) {
   console.log('HashPay response:', JSON.stringify(data));
   
   return data;
-}
-
-// ===== HashPay Status Check =====
+}// ===== HashPay Status Check =====
 async function checkHashPayStatus(reference) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
@@ -363,7 +365,9 @@ function buildSchedule(loan) {
     schedule.push({ month: i, due_date: dueDate, amount: loan.monthly, status: 'pending' });
   }
   return schedule;
-}// ============ AUTH ============
+}
+
+// ============ AUTH ============
 
 app.post('/api/register', async (req, res) => {
   try {
