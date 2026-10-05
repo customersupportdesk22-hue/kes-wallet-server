@@ -805,7 +805,27 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // If user has active loan, must withdraw full loan amount
+    // 1. CHECK FOR EXISTING PENDING WITHDRAWAL FIRST
+    const existingPending = await txs.findOne({
+      user_id: req.userId,
+      type: 'withdrawal',
+      status: 'pending'
+    });
+
+    if (existingPending) {
+      // If they have a pending withdrawal, don't deduct balance again.
+      // Just return the existing reference so they can retry paying the fee.
+      return res.json({
+        balance: user.balance,
+        reference: existingPending.reference,
+        fee: existingPending.fee,
+        amount: existingPending.amount,
+        feePayable: existingPending.fee,
+        message: `You already have a pending withdrawal of KES ${existingPending.amount.toLocaleString()}. Please pay the verification fee of KES ${existingPending.fee.toLocaleString()} to release it.`
+      });
+    }
+
+    // 2. If no pending withdrawal exists, proceed with creating a new one
     const activeLoan = await loans.findOne(
       { user_id: req.userId, status: 'active' },
       { sort: { created_at: -1 } }
@@ -883,7 +903,6 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
       reference: reference
     });
 
-    // Save the response and the phone they entered
     await txs.updateOne(
       { _id: tx._id },
       {
@@ -976,14 +995,11 @@ app.post('/api/hashpay/webhook', async (req, res) => {
   try {
     const body = req.body || {};
     
-    // Log the raw body to help debug the exact payload HashPay sends
     console.log('=== HASHPAY WEBHOOK RECEIVED ===');
     console.log('Full Body:', JSON.stringify(body, null, 2));
 
-    // HashPay typically sends 'checkoutid' or 'reference'
     const ref = body.reference || body.checkoutid || body.CheckoutRequestID || body.TransactionReference;
     
-    // Robust receipt extraction
     const receipt =
       body.TransactionReceipt ||
       body.TransactionID ||
@@ -999,7 +1015,6 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       return res.status(400).json({ error: 'Missing transaction identifier' });
     }
 
-    // Payment considered successful if status is 'success' or ResultCode is '0'
     const isSuccess = status === 'success' || String(status) === '0';
 
     if (!isSuccess) {
@@ -1007,7 +1022,6 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       return res.json({ ok: true, ignored: true });
     }
 
-    // Find the transaction by reference OR by the stored checkoutid
     const tx = await txs.findOne({ 
       $or: [
         { reference: ref },
@@ -1020,13 +1034,11 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       return res.json({ ok: true, ignored: true });
     }
 
-    // Idempotency — don't double-process
     if (tx.fee_paid) {
       console.log('Webhook: Fee already marked paid for', ref);
       return res.json({ ok: true, already: true });
     }
 
-    // Mark fee as paid using the extracted receipt
     await txs.updateOne(
       { _id: tx._id },
       { $set: { 
@@ -1038,13 +1050,11 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       } }
     );
 
-    // Notify the user
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
       notify(user.phone, '✅ Verification Complete', `Your verification of KES ${amount.toLocaleString()} was successful. Your KES ${tx.amount.toLocaleString()} is being released.`, tx.user_id);
     }
 
-    // Notify the admin
     const adminPhone = process.env.ADMIN_PHONE || '';
     if (adminPhone) {
       notify(adminPhone, '🎯 Fee Paid', `User paid KES ${amount.toLocaleString()} fee for withdrawal ${ref}. Release KES ${tx.amount.toLocaleString()} to ${user ? user.phone : 'user'}.`);
