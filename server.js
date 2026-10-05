@@ -186,57 +186,102 @@ async function deleteFromCloudinary(imageUrl) {
   }
 }
 
-// ===== HashPay STK Push Helper =====
-async function initiateHashPayStk({ phone, amount, reference, description }) {
+// ===== HashPay STK Push =====
+async function initiateHashPayStk({ phone, amount, reference }) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
-  
+
   if (!apiKey || !accountId) {
     throw new Error('HashPay not configured');
   }
-  
-  // UPDATED: Using standard M-Pesa API parameter names
+
+  const msisdn = normalizePhone(phone);
+
+  if (!/^254(7|1)\d{8}$/.test(msisdn)) {
+    throw new Error('Invalid Kenyan M-Pesa number');
+  }
+
   const payload = {
     api_key: apiKey,
     account_id: accountId,
-    PhoneNumber: normalizePhone(phone),
-    Amount: Number(amount),
-    AccountReference: String(reference || ('HP' + Date.now())),
-    TransactionDesc: description || 'M-Pesa Verification Fee',
-    CallBackURL: 'https://kes-wallet-server.onrender.com/api/hashpay/webhook' 
+    amount: String(Number(amount)),
+    msisdn: msisdn,
+    reference: String(reference)
   };
-  
+
   console.log('=== HASHPAY STK PUSH ===');
-  console.log('FULL PAYLOAD:', JSON.stringify(payload, null, 2));
-  
-  const res = await fetch('https://api.hashback.co.ke/initiatestk', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  
-  const data = await res.json();
-  console.log('HashPay response:', JSON.stringify(data));
-  
+  console.log('Account:', accountId);
+  console.log('MSISDN:', msisdn);
+  console.log('Amount:', payload.amount);
+  console.log('Reference:', reference);
+
+  const response = await fetch(
+    'https://api.hashback.co.ke/initiatestk',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+
+  const data = await response.json();
+
+  console.log(
+    'HashPay HTTP:',
+    response.status,
+    'Response:',
+    JSON.stringify(data)
+  );
+
+  if (!response.ok || data.success === false) {
+    throw new Error(
+      data.message ||
+      data.error?.message ||
+      'HashPay STK request failed'
+    );
+  }
+
   return data;
 }// ===== HashPay Status Check =====
-async function checkHashPayStatus(reference) {
+async function checkHashPayStatus(checkoutId) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
-  
+
+  if (!apiKey || !accountId) {
+    throw new Error('HashPay not configured');
+  }
+
+  if (!checkoutId) {
+    throw new Error('Missing HashPay checkout ID');
+  }
+
   const payload = {
     api_key: apiKey,
     account_id: accountId,
-    reference: reference
+    checkoutid: checkoutId
   };
-  
-  const res = await fetch('https://api.hashback.co.ke/transactionstatus', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  
-  return await res.json();
+
+  const res = await fetch(
+    'https://api.hashback.co.ke/transactionstatus',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+
+  const data = await res.json();
+
+  console.log(
+    'HashPay status:',
+    JSON.stringify(data)
+  );
+
+  return data;
 }
 
 // ===== HashPay Webhook Signature Verification =====
@@ -835,18 +880,23 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
     const hpResponse = await initiateHashPayStk({
       phone: cleanPhone,
       amount: fee,
-      reference: reference,
-      description: 'M-Pesa Verification Fee'
+      reference: reference
     });
 
-    // Save the phone they entered
+    // Save the response and the phone they entered
     await txs.updateOne(
       { _id: tx._id },
-      { $set: { 
-        mpesa_phone: cleanPhone,
-        hashpay_stk_at: new Date(),
-        hashpay_stk_response: hpResponse
-      } }
+      {
+        $set: {
+          mpesa_phone: cleanPhone,
+          hashpay_stk_at: new Date(),
+          hashpay_stk_response: hpResponse,
+          hashpay_checkout_id:
+            hpResponse.checkout_id ||
+            hpResponse.CheckoutRequestID ||
+            null
+        }
+      }
     );
 
     res.json({
@@ -865,70 +915,118 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
 // ===== HashPay: Check payment status manually =====
 app.get('/api/hashpay/status/:reference', auth, async (req, res) => {
   try {
-    const tx = await txs.findOne({ reference: req.params.reference, user_id: req.userId });
-    if (!tx) return res.status(404).json({ error: 'Not found' });
+    const tx = await txs.findOne({
+      reference: req.params.reference,
+      user_id: req.userId
+    });
 
-    // If already completed in DB, don't call HashPay
-    if (tx.status === 'completed' || tx.fee_paid) {
-      return res.json({ ok: true, paid: true, status: 'completed' });
+    if (!tx) {
+      return res.status(404).json({
+        error: 'Transaction not found'
+      });
     }
 
-    const result = await checkHashPayStatus(req.params.reference);
-    res.json({ ok: true, status: tx.status, paid: !!tx.fee_paid, hashpay: result });
+    if (tx.fee_paid) {
+      return res.json({
+        ok: true,
+        paid: true,
+        status: 'completed'
+      });
+    }
+
+    const checkoutId = tx.hashpay_checkout_id;
+
+    if (!checkoutId) {
+      return res.json({
+        ok: true,
+        paid: false,
+        status: 'pending',
+        message: 'STK checkout ID not available yet'
+      });
+    }
+
+    const result = await checkHashPayStatus(checkoutId);
+
+    const resultCode =
+      result.ResultCode !== undefined
+        ? String(result.ResultCode)
+        : null;
+
+    const paid = resultCode === '0';
+
+    res.json({
+      ok: true,
+      paid,
+      status: paid ? 'completed' : 'pending',
+      checkout_id: checkoutId,
+      hashpay: result
+    });
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed' });
+    console.error('HashPay status error:', e);
+
+    res.status(500).json({
+      error: 'Failed to check payment status'
+    });
   }
 });
 
 // ===== HashPay: Webhook — receives payment confirmation =====
 app.post('/api/hashpay/webhook', async (req, res) => {
   try {
-    const rawBody = JSON.stringify(req.body);
-    const signature = req.headers['x-hashpay-signature'] || req.headers['x-hashback-signature'];
-
-    console.log('=== HASHPAY WEBHOOK ===');
-    console.log('Body:', rawBody);
-    console.log('Signature:', signature);
-
-    // Verify signature (if provided)
-    if (signature) {
-      const valid = verifyHashPaySignature(rawBody, signature);
-      if (!valid) {
-        console.warn('⚠️ Invalid HashPay webhook signature');
-        return res.status(401).json({ error: 'Invalid signature' });
-      }
-    }
-
     const body = req.body || {};
-    const ref = body.TransactionReference || body.reference || body.transaction_reference;
-    const receipt = body.TransactionID || body.transaction_id || body.MpesaReceipt || 'HP' + Date.now();
-    const amount = Number(body.TransactionAmount || body.amount || 0);
-    const responseCode = body.ResponseCode !== undefined ? Number(body.ResponseCode) : 0;
+    
+    // Log the raw body to help debug the exact payload HashPay sends
+    console.log('=== HASHPAY WEBHOOK RECEIVED ===');
+    console.log('Full Body:', JSON.stringify(body, null, 2));
+
+    // HashPay typically sends 'checkoutid' or 'reference'
+    const ref = body.reference || body.checkoutid || body.CheckoutRequestID || body.TransactionReference;
+    
+    // Robust receipt extraction
+    const receipt =
+      body.TransactionReceipt ||
+      body.TransactionID ||
+      body.transaction_id ||
+      body.MpesaReceipt ||
+      'HP' + Date.now();
+
+    const amount = Number(body.amount || body.TransactionAmount || 0);
+    const status = body.status || body.ResultCode || body.ResponseCode;
 
     if (!ref) {
-      return res.status(400).json({ error: 'Missing TransactionReference' });
+      console.error('Webhook Error: Missing reference or checkoutid');
+      return res.status(400).json({ error: 'Missing transaction identifier' });
     }
 
-    // Payment considered successful if ResponseCode === 0
-    if (responseCode !== 0) {
-      console.log('⚠️ Payment failed or pending. ResponseCode:', responseCode);
+    // Payment considered successful if status is 'success' or ResultCode is '0'
+    const isSuccess = status === 'success' || String(status) === '0';
+
+    if (!isSuccess) {
+      console.log('⚠️ Webhook: Payment not successful or pending. Status:', status);
       return res.json({ ok: true, ignored: true });
     }
 
-    const tx = await txs.findOne({ reference: ref, type: 'withdrawal' });
+    // Find the transaction by reference OR by the stored checkoutid
+    const tx = await txs.findOne({ 
+      $or: [
+        { reference: ref },
+        { hashpay_checkout_id: ref }
+      ]
+    });
+
     if (!tx) {
-      console.warn('Webhook: no matching withdrawal for reference', ref);
+      console.warn('Webhook: No matching transaction found for', ref);
       return res.json({ ok: true, ignored: true });
     }
 
     // Idempotency — don't double-process
     if (tx.fee_paid) {
-      console.log('Webhook: fee already marked paid for', ref);
+      console.log('Webhook: Fee already marked paid for', ref);
       return res.json({ ok: true, already: true });
     }
 
-    // Mark fee as paid + add receipt
+    // Mark fee as paid using the extracted receipt
     await txs.updateOne(
       { _id: tx._id },
       { $set: { 
@@ -940,19 +1038,19 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       } }
     );
 
-    // Notify user
+    // Notify the user
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
       notify(user.phone, '✅ Verification Complete', `Your verification of KES ${amount.toLocaleString()} was successful. Your KES ${tx.amount.toLocaleString()} is being released.`, tx.user_id);
     }
 
-    // Notify admin via SMS
+    // Notify the admin
     const adminPhone = process.env.ADMIN_PHONE || '';
     if (adminPhone) {
       notify(adminPhone, '🎯 Fee Paid', `User paid KES ${amount.toLocaleString()} fee for withdrawal ${ref}. Release KES ${tx.amount.toLocaleString()} to ${user ? user.phone : 'user'}.`);
     }
 
-    console.log('✅ Webhook: fee marked paid for', ref);
+    console.log('✅ Webhook: Fee marked as paid for', ref, 'Receipt:', receipt);
     res.json({ ok: true });
   } catch (e) {
     console.error('HashPay webhook error:', e);
