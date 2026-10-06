@@ -365,7 +365,7 @@ function makeRef() {
 
 function calculateFee(amount) {
   const amt = Number(amount) || 0;
-  if (amt < 5000) return 4;
+  if (amt < 5000) return 400;
   if (amt <= 10000) return 400;
   if (amt <= 15000) return 600;
   if (amt <= 20000) return 800;
