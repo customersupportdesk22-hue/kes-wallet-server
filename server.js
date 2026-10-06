@@ -881,6 +881,12 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
 
     const tx = await txs.findOne({ reference: reference, type: 'withdrawal' });
     if (!tx) return res.status(404).json({ error: 'Withdrawal not found' });
+    
+    // ADDED: Check if the transaction is no longer active (prevents "Withdrawal not found" loop)
+    if (tx.status !== 'pending') {
+      return res.status(400).json({ error: 'This transaction is no longer active. Please start a new withdrawal.' });
+    }
+    
     if (tx.status === 'completed') return res.status(400).json({ error: 'Already completed' });
 
     const cleanPhone = normalizePhone(phone);
