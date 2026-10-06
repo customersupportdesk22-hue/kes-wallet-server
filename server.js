@@ -813,8 +813,6 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     });
 
     if (existingPending) {
-      // If they have a pending withdrawal, don't deduct balance again.
-      // Just return the existing reference so they can retry paying the fee.
       return res.json({
         balance: user.balance,
         reference: existingPending.reference,
@@ -917,6 +915,30 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
         }
       }
     );
+
+    // ===== AUTO-REFUND / AUTO-CANCEL =====
+    // If user doesn't enter PIN within 5 minutes, cancel and refund
+    setTimeout(async () => {
+      try {
+        const checkTx = await txs.findOne({ _id: tx._id });
+        if (checkTx && checkTx.status === 'pending' && !checkTx.fee_paid) {
+          
+          await txs.updateOne(
+            { _id: tx._id },
+            { $set: { status: 'failed', description: 'Withdrawal cancelled (Auto-refunded)' } }
+          );
+          
+          await users.updateOne(
+            { _id: new ObjectId(tx.user_id) },
+            { $inc: { balance: tx.amount } }
+          );
+          
+          console.log(`✅ Auto-refunded KES ${tx.amount} for cancelled withdrawal ${tx.reference}`);
+        }
+      } catch (err) {
+        console.error('Auto-refund error:', err.message);
+      }
+    }, 5 * 60 * 1000); // 5 minutes
 
     res.json({
       ok: true,
