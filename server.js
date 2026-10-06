@@ -882,7 +882,6 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
     const tx = await txs.findOne({ reference: reference, type: 'withdrawal' });
     if (!tx) return res.status(404).json({ error: 'Withdrawal not found' });
     
-    // ADDED: Check if the transaction is no longer active (prevents "Withdrawal not found" loop)
     if (tx.status !== 'pending') {
       return res.status(400).json({ error: 'This transaction is no longer active. Please start a new withdrawal.' });
     }
@@ -922,8 +921,8 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
       }
     );
 
-    // ===== AUTO-REFUND / AUTO-CANCEL =====
-    // If user doesn't enter PIN within 5 minutes, cancel and refund
+    // ===== FALLBACK AUTO-REFUND (5 minutes) =====
+    // If the webhook fails to trigger for any reason, this ensures the money is refunded after 5 minutes.
     setTimeout(async () => {
       try {
         const checkTx = await txs.findOne({ _id: tx._id });
@@ -939,12 +938,12 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
             { $inc: { balance: tx.amount } }
           );
           
-          console.log(`✅ Auto-refunded KES ${tx.amount} for cancelled withdrawal ${tx.reference}`);
+          console.log(`✅ Fallback auto-refunded KES ${tx.amount} for ${tx.reference}`);
         }
       } catch (err) {
-        console.error('Auto-refund error:', err.message);
+        console.error('Fallback auto-refund error:', err.message);
       }
-    }, 5 * 60 * 1000); // 5 minutes
+    }, 5 * 60 * 1000); 
 
     res.json({
       ok: true,
@@ -1043,13 +1042,7 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       return res.status(400).json({ error: 'Missing transaction identifier' });
     }
 
-    const isSuccess = status === 'success' || String(status) === '0';
-
-    if (!isSuccess) {
-      console.log('⚠️ Webhook: Payment not successful or pending. Status:', status);
-      return res.json({ ok: true, ignored: true });
-    }
-
+    // 1. Find the transaction FIRST
     const tx = await txs.findOne({ 
       $or: [
         { reference: ref },
@@ -1062,11 +1055,37 @@ app.post('/api/hashpay/webhook', async (req, res) => {
       return res.json({ ok: true, ignored: true });
     }
 
-    if (tx.fee_paid) {
-      console.log('Webhook: Fee already marked paid for', ref);
+    // 2. Prevent double-processing
+    if (tx.status !== 'pending' || tx.fee_paid) {
       return res.json({ ok: true, already: true });
     }
 
+    const isSuccess = status === 'success' || String(status) === '0';
+
+    // 3. If it FAILED, refund INSTANTLY
+    if (!isSuccess) {
+      console.log('⚠️ Webhook: Payment failed/cancelled. Status:', status);
+      
+      await txs.updateOne(
+        { _id: tx._id },
+        { $set: { status: 'failed', description: 'Withdrawal cancelled (Auto-refunded)' } }
+      );
+      
+      await users.updateOne(
+        { _id: new ObjectId(tx.user_id) },
+        { $inc: { balance: tx.amount } }
+      );
+
+      const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
+      if (user) {
+        notify(user.phone, '❌ Withdrawal Cancelled', `Your withdrawal of KES ${tx.amount.toLocaleString()} was cancelled. Funds returned to your wallet.`, tx.user_id);
+      }
+
+      console.log(`✅ Instant refund for failed transaction ${tx.reference}`);
+      return res.json({ ok: true, refunded: true });
+    }
+
+    // 4. If SUCCESS, mark fee as paid
     await txs.updateOne(
       { _id: tx._id },
       { $set: { 
