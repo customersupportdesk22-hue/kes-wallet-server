@@ -42,7 +42,6 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 
 const REFERRAL_BONUS = 50;
-const UNVERIFIED_LOAN_LIMIT = 5000;
 
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
 const AT_API_KEY = process.env.AT_API_KEY || '';
@@ -1243,14 +1242,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
 
     const kycStatus = user.kyc_status || 'unverified';
-    if (amt > UNVERIFIED_LOAN_LIMIT && kycStatus !== 'verified') {
-      return res.status(403).json({
-        error: `Identity verification required. Unverified users can borrow up to KES ${UNVERIFIED_LOAN_LIMIT.toLocaleString()}. Please complete KYC to access larger loans.`,
-        kyc_required: true,
-        kyc_status: kycStatus,
-        max_unverified: UNVERIFIED_LOAN_LIMIT
-      });
-    }
 
     const rate = 10;
     const r = rate / 100 / 12;
