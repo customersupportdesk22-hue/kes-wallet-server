@@ -825,7 +825,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
       });
     }
 
-    // 2. If no pending withdrawal exists, proceed with creating a new one
+    // 2. STRICT FULL WITHDRAWAL CHECK
     const activeLoan = await loans.findOne(
       { user_id: req.userId, status: 'active' },
       { sort: { created_at: -1 } }
