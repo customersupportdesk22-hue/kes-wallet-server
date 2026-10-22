@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 const AfricasTalking = require('africastalking');
-const nodemailer = require('nodemailer'); // ADDED NODEMAILER
+const { Resend } = require('resend'); // RESEND INSTEAD OF BREVO/NODEMAILER
 
 const app = express();
 app.use(cors());
@@ -15,42 +15,36 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
 
-// ===== EMAIL SETUP (BREVO HTTP API) =====
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+// ===== EMAIL SETUP (RESEND) =====
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 async function sendEmail(to, subject, htmlContent) {
-  if (!BREVO_API_KEY) {
-    console.log('⚠️ Email skipped: BREVO_API_KEY not configured');
+  if (!process.env.RESEND_API_KEY) {
+    console.log('⚠️ Email skipped: RESEND_API_KEY not configured');
     return false;
   }
 
   try {
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': BREVO_API_KEY,
-      },
-      body: JSON.stringify({
-        sender: { name: 'KCB Biashara Loans', email: 'info@biasharaloans.co.ke' }, // Updated Sender
-        to: [{ email: to }],
-        subject: subject,
-        htmlContent: htmlContent,
-      }),
+    const { data, error } = await resend.emails.send({
+      from: 'KCB Biashara Loans <info@biasharaloans.co.ke>', // Your verified domain
+      to: [to],
+      subject: subject,
+      html: htmlContent,
     });
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.message || 'Brevo API request failed');
+    if (error) {
+      console.error('📧 Resend API error:', error);
+      return false;
     }
 
-    console.log('📧 Email sent via Brevo API');
+    console.log('📧 Email sent via Resend API:', data.id);
     return true;
   } catch (error) {
     console.error('📧 Email failed:', error);
     return false;
   }
 }
+
 app.get('/api/test-loan', (req, res) => {
   res.json({ ok: true, message: 'Loan endpoint test successful', timestamp: new Date().toISOString() });
 });
@@ -65,9 +59,8 @@ app.get('/api/diagnostic', (req, res) => {
     has_fee_system: true,
     has_kyc: true,
     has_cloudinary: !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY,
-    has_email: !!SMTP_USER && !!SMTP_PASS,
-    has_hashpay: !!(process.env.HASHPAY_API_KEY && process.env.HASHPAY_ACCOUNT_ID),
-    version: 'v14-email-kyc'
+    has_email: !!process.env.RESEND_API_KEY,
+    version: 'v15-resend'
   });
 });
 
@@ -100,14 +93,10 @@ function normalizePhone(input) {
 }
 
 async function sendSMS(phone, message) {
-  if (!atSms || !AT_API_KEY) {
-    console.log('SMS skipped - AT not configured');
-    return;
-  }
+  if (!atSms || !AT_API_KEY) return;
   try {
     const to = '+' + normalizePhone(phone);
-    const result = await atSms.send({ to: [to], message });
-    return result;
+    return await atSms.send({ to: [to], message });
   } catch(e) {
     console.error('SMS failed:', e.message);
   }
@@ -176,7 +165,6 @@ async function uploadToCloudinary(base64Data) {
   const res = await fetch(url, { method: 'POST', body: formData });
   const data = await res.json();
   if (!data.secure_url) {
-    console.error('Cloudinary error:', data);
     throw new Error(data.error?.message || 'Cloudinary upload failed');
   }
   return data.secure_url;
@@ -184,9 +172,7 @@ async function uploadToCloudinary(base64Data) {
 
 async function deleteFromCloudinary(imageUrl) {
   try {
-    if (!imageUrl || !CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-      return false;
-    }
+    if (!imageUrl || !CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) return false;
     const uploadMarker = '/image/upload/';
     const idx = imageUrl.indexOf(uploadMarker);
     if (idx === -1) return false;
@@ -207,14 +193,8 @@ async function deleteFromCloudinary(imageUrl) {
     formData.append('signature', signature);
     const res = await fetch(url, { method: 'POST', body: formData });
     const data = await res.json();
-    if (data.result === 'ok') {
-      console.log('✅ Cloudinary deleted:', publicId);
-      return true;
-    }
-    console.log('⚠️ Cloudinary delete failed:', data);
-    return false;
+    return data.result === 'ok';
   } catch(e) {
-    console.error('Delete Cloudinary error:', e.message);
     return false;
   }
 }
@@ -389,9 +369,7 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
-    const user = await getUserById(result.insertedId);
-    const token = jwt.sign({ userId: newUserId }, JWT_SECRET, { expiresIn: '90d' });
-    res.json({ token, user: sanitize(user) });
+    res.json({ ok: true, message: 'Registered. Please verify OTP.', email: email });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Registration failed' });
@@ -447,7 +425,11 @@ app.post('/api/auth/send-otp', async (req, res) => {
       </div>
     `;
 
-    await sendEmail(user.email, 'Your Verification Code - Biashara Boost', html);
+    const sent = await sendEmail(user.email, 'Your Verification Code - Biashara Boost', html);
+    if (!sent) {
+      return res.status(500).json({ error: 'Failed to send email' });
+    }
+    
     res.json({ ok: true, message: 'OTP sent to email' });
   } catch (e) {
     console.error(e);
@@ -461,18 +443,18 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     const user = await users.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    if (user.email_otp !== otp) return res.status(400).json({ error: 'Invalid verification code' });
+    if (String(user.email_otp) !== String(otp)) return res.status(400).json({ error: 'Invalid verification code' });
     if (new Date() > new Date(user.email_otp_expires)) return res.status(400).json({ error: 'Verification code has expired' });
 
     await users.updateOne({ _id: user._id }, { $set: { is_email_verified: true }, $unset: { email_otp: 1, email_otp_expires: 1 } });
-    res.json({ ok: true, message: 'Email verified successfully' });
+    
+    const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: '90d' });
+    res.json({ ok: true, token, user: sanitize(user), message: 'Email verified successfully' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Verification failed' });
   }
-});
-
-// ============ KYC ============
+});// ============ KYC ============
 
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
@@ -505,7 +487,9 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     console.error('KYC submit error:', e);
     res.status(500).json({ error: 'KYC submission failed: ' + e.message });
   }
-});app.get('/api/kyc/status', auth, async (req, res) => {
+});
+
+app.get('/api/kyc/status', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -813,7 +797,7 @@ app.post('/api/pwa/installed', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v14-email-kyc' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v15-resend' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
