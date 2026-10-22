@@ -15,42 +15,42 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
 
-// ===== EMAIL SETUP =====
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp-relay.brevo.com';
-const SMTP_PORT = process.env.SMTP_PORT || 587;
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
-
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_PORT == 465,
-  auth: {
-    user: SMTP_USER,
-    pass: SMTP_PASS,
-  },
-});
+// ===== EMAIL SETUP (BREVO HTTP API) =====
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 
 async function sendEmail(to, subject, htmlContent) {
-  if (!SMTP_USER || !SMTP_PASS) {
-    console.log('⚠️ Email skipped: SMTP credentials not configured');
+  if (!BREVO_API_KEY) {
+    console.log('⚠️ Email skipped: BREVO_API_KEY not configured');
     return false;
   }
+
   try {
-    const info = await transporter.sendMail({
-      from: `"Biashara Boost Loans" <${SMTP_USER}>`,
-      to: to,
-      subject: subject,
-      html: htmlContent,
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: { name: 'Biashara Boost Loans', email: 'info@biasharaloans.co.ke' }, // Updated Sender
+        to: [{ email: to }],
+        subject: subject,
+        htmlContent: htmlContent,
+      }),
     });
-    console.log('📧 Email sent:', info.messageId);
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.message || 'Brevo API request failed');
+    }
+
+    console.log('📧 Email sent via Brevo API');
     return true;
   } catch (error) {
     console.error('📧 Email failed:', error);
     return false;
   }
 }
-
 app.get('/api/test-loan', (req, res) => {
   res.json({ ok: true, message: 'Loan endpoint test successful', timestamp: new Date().toISOString() });
 });
