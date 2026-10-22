@@ -8,7 +8,7 @@ const AfricasTalking = require('africastalking');
 
 const app = express();
 app.use(cors());
-// CHANGED: Increased limit to 50mb for KYC image uploads
+// Increased limit to 50mb for KYC image uploads
 app.use(express.json({ limit: '50mb' }));
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
@@ -34,7 +34,7 @@ app.get('/api/diagnostic', (req, res) => {
     has_cleanup_tools: true,
     has_pwa_tracking: true,
     has_hashpay: !!(process.env.HASHPAY_API_KEY && process.env.HASHPAY_ACCOUNT_ID),
-    version: 'v12-hashpay'
+    version: 'v13-strict-kyc'
   });
 });
 
@@ -305,9 +305,7 @@ function verifyHashPaySignature(rawBody, signatureHeader) {
     console.error('Signature verify error:', e.message);
     return false;
   }
-}
-
-let db, users, txs, loans, notifications, kyc;
+}let db, users, txs, loans, notifications, kyc;
 
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI);
@@ -507,7 +505,6 @@ app.get('/api/me', auth, async (req, res) => {
 
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
-    // CHANGED: Now expects idFrontPhoto, idBackPhoto, and selfiePhoto
     const { idFrontPhoto, idBackPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
     
     if (!idFrontPhoto || !idBackPhoto || !selfiePhoto) {
@@ -526,23 +523,17 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
 
     console.log('=== KYC SUBMIT ===');
     
-    // Upload all 3 photos
     const idFrontUrl = await uploadToCloudinary(idFrontPhoto);
-    console.log('ID Front uploaded:', idFrontUrl);
-
     const idBackUrl = await uploadToCloudinary(idBackPhoto);
-    console.log('ID Back uploaded:', idBackUrl);
-
     const selfieUrl = await uploadToCloudinary(selfiePhoto);
-    console.log('Selfie uploaded:', selfieUrl);
 
     const submission = {
       user_id: req.userId,
       full_name: fullName,
       id_number: idNumber,
       dob: dob || null,
-      id_front_url: idFrontUrl,    // Added
-      id_back_url: idBackUrl,      // Added
+      id_front_url: idFrontUrl,
+      id_back_url: idBackUrl,
       selfie_photo_url: selfieUrl,
       status: 'pending',
       submitted_at: new Date(),
@@ -630,8 +621,8 @@ app.get('/api/admin/pending-kyc', auth, async (req, res) => {
       full_name: k.full_name,
       id_number: k.id_number,
       dob: k.dob,
-      id_front_url: k.id_front_url,    // Added
-      id_back_url: k.id_back_url,      // Added
+      id_front_url: k.id_front_url,
+      id_back_url: k.id_back_url,
       selfie_photo_url: k.selfie_photo_url,
       submitted_at: k.submitted_at,
       user: k.user ? {
@@ -694,9 +685,7 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'KYC review failed' });
   }
-});
-
-// ============ NOTIFICATIONS ============
+});// ============ NOTIFICATIONS ============
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -1217,9 +1206,7 @@ app.get('/api/lookup/:phone', async (req, res) => {
   } catch (e) {
     res.json({ found: false });
   }
-});
-
-// ============ LOANS ============
+});// ============ LOANS ============
 
 app.get('/api/loans', auth, async (req, res) => {
   try {
@@ -1248,25 +1235,62 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    // ==========================================
+    // 1. STRICT BACKEND VALIDATION
+    // ==========================================
+    const phoneRegex = /^(?:\+?254|0)?(7|1)\d{8}$/;
+    if (!phone || !phoneRegex.test(phone)) {
+      return res.status(400).json({ error: 'Invalid phone number format. Must be a valid Kenyan number.' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!email || !emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format.' });
+    }
+
+    const idRegex = /^\d{7,8}$/;
+    if (!idNumber || !idRegex.test(idNumber)) {
+      return res.status(400).json({ error: 'Invalid National ID. Must be 7 or 8 digits.' });
+    }
+
     const amt = Number(String(amount || '').replace(/[^\d.]/g, ''));
     const mnths = Number(String(months || '').replace(/[^\d]/g, ''));
     
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount: received "' + amount + '"' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months: received "' + months + '"' });
 
-    const kycStatus = user.kyc_status || 'unverified';
+    // ==========================================
+    // 2. CHECK FOR EXISTING ACTIVE/PENDING LOANS
+    // ==========================================
+    const existingLoan = await loans.findOne({
+      user_id: req.userId,
+      status: { $in: ['pending', 'active'] } // Blocks if they have a pending or active loan
+    });
 
+    if (existingLoan) {
+      return res.status(400).json({ 
+        error: 'You already have an active or pending loan. You must clear it before applying for a new one.' 
+      });
+    }
+
+    // ==========================================
+    // 3. CALCULATE LOAN DETAILS
+    // ==========================================
+    const kycStatus = user.kyc_status || 'unverified';
     const rate = 10;
     const r = rate / 100 / 12;
     let monthly;
     if (r === 0) monthly = amt / mnths;
     else { const f = Math.pow(1 + r, mnths); monthly = amt * r * f / (f - 1); }
-        monthly = Math.round(monthly);
+    monthly = Math.round(monthly);
     const total = monthly * mnths;
 
     const dueDate = new Date();
     dueDate.setMonth(dueDate.getMonth() + mnths);
 
+    // ==========================================
+    // 4. SAVE TO DATABASE
+    // ==========================================
     const result = await loans.insertOne({
       user_id: req.userId,
       amount: amt,
@@ -1279,10 +1303,10 @@ app.post('/api/loans/apply', auth, async (req, res) => {
       status: 'pending',
       purpose: purpose || 'Business Loan',
       employment: employment || 'N/A',
-      id_number: idNumber || user.id_number || 'N/A',
+      id_number: idNumber,
       full_name: fullName || user.name,
-      phone: phone || user.phone,
-      email: email || user.email,
+      phone: phone,
+      email: email,
       kyc_status_at_apply: kycStatus,
       created_at: new Date(),
       due_date: dueDate,
@@ -1713,7 +1737,7 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
 
 // ============ STARTUP ============
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v12-hashpay' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v13-strict-kyc' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
