@@ -32,7 +32,7 @@ async function sendEmail(to, subject, htmlContent) {
         'api-key': BREVO_API_KEY,
       },
       body: JSON.stringify({
-        sender: { name: 'Biashara Boost Loans', email: 'biasharaloans01@gmail.com' }, // Updated Sender
+        sender: { name: 'KCB Biashara Loans', email: 'info@biasharaloans.co.ke' }, // Updated Sender
         to: [{ email: to }],
         subject: subject,
         htmlContent: htmlContent,
