@@ -798,6 +798,218 @@ app.post('/api/pwa/installed', auth, async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v15-resend' }));
+// ============ MISSING ADMIN ROUTES ============
+
+// 1. Withdrawals
+app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const pending = await txs.aggregate([
+      { $match: { type: 'withdrawal', status: 'pending' } },
+      { $sort: { created_at: -1 } },
+      {
+        $lookup: {
+          from: 'users',
+          let: { uid: '$user_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } },
+            { $project: { name: 1, phone: 1, email: 1, balance: 1, kyc_status: 1 } }
+          ],
+          as: 'user'
+        }
+      },
+      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+      { $limit: 100 }
+    ]).toArray();
+
+    const items = pending.map(t => ({
+      id: t._id.toString(),
+      amount: t.amount,
+      fee: t.fee || calculateFee(t.amount),
+      reference: t.reference,
+      created_at: t.created_at,
+      description: t.description,
+      mpesa_phone: t.mpesa_phone || null,
+      fee_paid: t.fee_paid || false,
+      fee_receipt: t.fee_receipt || null,
+      user: t.user ? {
+        name: t.user.name,
+        phone: t.user.phone,
+        email: t.user.email,
+        balance: t.user.balance,
+        kyc_status: t.user.kyc_status || 'unverified'
+      } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown', balance: 0, kyc_status: 'unverified' }
+    }));
+
+    res.json({ items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load pending withdrawals' });
+  }
+});
+
+app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const { txId, mpesaReceipt } = req.body;
+    if (!txId) return res.status(400).json({ error: 'Missing transaction ID' });
+
+    const tx = await txs.findOne({ _id: new ObjectId(txId), type: 'withdrawal' });
+    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+    if (tx.status === 'completed') return res.status(400).json({ error: 'Already completed' });
+
+    const finalReceipt = mpesaReceipt || ('QK' + Date.now().toString().slice(-8));
+
+    await txs.updateOne(
+      { _id: new ObjectId(txId) },
+      { $set: { status: 'completed', mpesa_receipt: finalReceipt, description: 'Withdrawal to M-Pesa' } }
+    );
+
+    const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
+    if (user) {
+      notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`, tx.user_id);
+    }
+
+    res.json({ ok: true, receipt: finalReceipt });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Approval failed' });
+  }
+});
+
+// 2. Cleanup & Stats
+app.get('/api/admin/storage-stats', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const userCount = await users.countDocuments({});
+    const txCount = await txs.countDocuments({});
+    const loanCount = await loans.countDocuments({});
+    const notifCount = await notifications.countDocuments({});
+    const kycCount = await kyc.countDocuments({});
+    const kycWithPhotos = await kyc.countDocuments({ 
+      $or: [
+        { id_front_url: { $ne: null } },
+        { id_back_url: { $ne: null } },
+        { selfie_photo_url: { $ne: null } }
+      ]
+    });
+
+    res.json({
+      users: userCount,
+      transactions: txCount,
+      loans: loanCount,
+      notifications: notifCount,
+      kyc: kycCount,
+      kyc_with_photos: kycWithPhotos,
+      estimated_size_mb: Math.round((userCount * 1 + txCount * 1 + loanCount * 2 + notifCount * 0.5 + kycCount * 1) / 1024)
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const days = Number(req.body.days) || 90;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const targets = await kyc.find({
+      status: { $in: ['verified', 'rejected'] },
+      reviewed_at: { $lt: cutoff },
+      $or: [
+        { id_front_url: { $ne: null } },
+        { id_back_url: { $ne: null } },
+        { selfie_photo_url: { $ne: null } }
+      ]
+    }).limit(100).toArray();
+
+    let cleaned = 0;
+    for (const sub of targets) {
+      try {
+        if (sub.id_front_url) await deleteFromCloudinary(sub.id_front_url);
+        if (sub.id_back_url) await deleteFromCloudinary(sub.id_back_url);
+        if (sub.selfie_photo_url) await deleteFromCloudinary(sub.selfie_photo_url);
+        await kyc.updateOne(
+          { _id: sub._id },
+          { $set: { id_front_url: null, id_back_url: null, selfie_photo_url: null, photos_cleaned_at: new Date() } }
+        );
+        cleaned++;
+      } catch(e) {
+        console.error('Cleanup single error:', e.message);
+      }
+    }
+
+    res.json({ ok: true, cleaned: cleaned, total_found: targets.length, days: days });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
+app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const days = Number(req.body.days) || 30;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const result = await notifications.deleteMany({
+      created_at: { $lt: cutoff }
+    });
+
+    res.json({ ok: true, deleted: result.deletedCount, days: days });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
+// 3. PWA Installs
+app.get('/api/admin/pwa-installs', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+
+    const installed = await users.find({
+      pwa_installed: true,
+      role: { $ne: 'admin' }
+    }).sort({ pwa_installed_at: -1 }).limit(200).toArray();
+
+    const totalUsers = await users.countDocuments({ role: { $ne: 'admin' } });
+    const totalInstalls = await users.countDocuments({ pwa_installed: true, role: { $ne: 'admin' } });
+
+    const items = installed.map(u => ({
+      id: u._id.toString(),
+      name: u.name,
+      phone: u.phone,
+      email: u.email,
+      kyc_status: u.kyc_status || 'unverified',
+      installed_at: u.pwa_installed_at,
+      user_agent: u.pwa_user_agent || null
+    }));
+
+    res.json({
+      items,
+      total_users: totalUsers,
+      total_installs: totalInstalls,
+      install_rate: totalUsers > 0 ? Math.round((totalInstalls / totalUsers) * 100) : 0
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to load installs' });
+  }
+});
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
