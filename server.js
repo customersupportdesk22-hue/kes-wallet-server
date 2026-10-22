@@ -8,7 +8,8 @@ const AfricasTalking = require('africastalking');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+// CHANGED: Increased limit to 50mb for KYC image uploads
+app.use(express.json({ limit: '50mb' }));
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
@@ -243,7 +244,9 @@ async function initiateHashPayStk({ phone, amount, reference }) {
   }
 
   return data;
-}// ===== HashPay Status Check =====
+}
+
+// ===== HashPay Status Check =====
 async function checkHashPayStatus(checkoutId) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
@@ -504,9 +507,11 @@ app.get('/api/me', auth, async (req, res) => {
 
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
-    const { idPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
-    if (!idPhoto || !selfiePhoto) {
-      return res.status(400).json({ error: 'Both ID photo and selfie are required' });
+    // CHANGED: Now expects idFrontPhoto, idBackPhoto, and selfiePhoto
+    const { idFrontPhoto, idBackPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
+    
+    if (!idFrontPhoto || !idBackPhoto || !selfiePhoto) {
+      return res.status(400).json({ error: 'ID Front, ID Back, and Selfie are all required' });
     }
     if (!fullName || !idNumber) {
       return res.status(400).json({ error: 'Full name and ID number are required' });
@@ -520,8 +525,13 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     }
 
     console.log('=== KYC SUBMIT ===');
-    const idUrl = await uploadToCloudinary(idPhoto);
-    console.log('ID uploaded:', idUrl);
+    
+    // Upload all 3 photos
+    const idFrontUrl = await uploadToCloudinary(idFrontPhoto);
+    console.log('ID Front uploaded:', idFrontUrl);
+
+    const idBackUrl = await uploadToCloudinary(idBackPhoto);
+    console.log('ID Back uploaded:', idBackUrl);
 
     const selfieUrl = await uploadToCloudinary(selfiePhoto);
     console.log('Selfie uploaded:', selfieUrl);
@@ -531,7 +541,8 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
       full_name: fullName,
       id_number: idNumber,
       dob: dob || null,
-      id_photo_url: idUrl,
+      id_front_url: idFrontUrl,    // Added
+      id_back_url: idBackUrl,      // Added
       selfie_photo_url: selfieUrl,
       status: 'pending',
       submitted_at: new Date(),
@@ -619,7 +630,8 @@ app.get('/api/admin/pending-kyc', auth, async (req, res) => {
       full_name: k.full_name,
       id_number: k.id_number,
       dob: k.dob,
-      id_photo_url: k.id_photo_url,
+      id_front_url: k.id_front_url,    // Added
+      id_back_url: k.id_back_url,      // Added
       selfie_photo_url: k.selfie_photo_url,
       submitted_at: k.submitted_at,
       user: k.user ? {
@@ -682,7 +694,9 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'KYC review failed' });
   }
-});// ============ NOTIFICATIONS ============
+});
+
+// ============ NOTIFICATIONS ============
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -921,7 +935,6 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
     );
 
     // ===== FALLBACK AUTO-REFUND (5 minutes) =====
-    // If the webhook fails to trigger for any reason, this ensures the money is refunded after 5 minutes.
     setTimeout(async () => {
       try {
         const checkTx = await txs.findOne({ _id: tx._id });
@@ -1248,7 +1261,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     let monthly;
     if (r === 0) monthly = amt / mnths;
     else { const f = Math.pow(1 + r, mnths); monthly = amt * r * f / (f - 1); }
-    monthly = Math.round(monthly);
+        monthly = Math.round(monthly);
     const total = monthly * mnths;
 
     const dueDate = new Date();
@@ -1282,7 +1295,9 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     console.error('LOAN APPLY ERROR:', e);
     res.status(500).json({ error: 'Loan failed: ' + e.message });
   }
-});// ============ ADMIN: LIST PENDING WITHDRAWALS ============
+});
+
+// ============ ADMIN: LIST PENDING WITHDRAWALS ============
 app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1487,7 +1502,8 @@ app.get('/api/admin/storage-stats', auth, async (req, res) => {
     const kycCount = await kyc.countDocuments({});
     const kycWithPhotos = await kyc.countDocuments({ 
       $or: [
-        { id_photo_url: { $ne: null } },
+        { id_front_url: { $ne: null } },
+        { id_back_url: { $ne: null } },
         { selfie_photo_url: { $ne: null } }
       ]
     });
@@ -1519,7 +1535,8 @@ app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
       status: { $in: ['verified', 'rejected'] },
       reviewed_at: { $lt: cutoff },
       $or: [
-        { id_photo_url: { $ne: null } },
+        { id_front_url: { $ne: null } },
+        { id_back_url: { $ne: null } },
         { selfie_photo_url: { $ne: null } }
       ]
     }).limit(100).toArray();
@@ -1527,11 +1544,12 @@ app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
     let cleaned = 0;
     for (const sub of targets) {
       try {
-        if (sub.id_photo_url) await deleteFromCloudinary(sub.id_photo_url);
+        if (sub.id_front_url) await deleteFromCloudinary(sub.id_front_url);
+        if (sub.id_back_url) await deleteFromCloudinary(sub.id_back_url);
         if (sub.selfie_photo_url) await deleteFromCloudinary(sub.selfie_photo_url);
         await kyc.updateOne(
           { _id: sub._id },
-          { $set: { id_photo_url: null, selfie_photo_url: null, photos_cleaned_at: new Date() } }
+          { $set: { id_front_url: null, id_back_url: null, selfie_photo_url: null, photos_cleaned_at: new Date() } }
         );
         cleaned++;
       } catch(e) {
@@ -1573,7 +1591,8 @@ app.delete('/api/admin/kyc/:id', auth, async (req, res) => {
     const record = await kyc.findOne({ _id: new ObjectId(req.params.id) });
     if (!record) return res.status(404).json({ error: 'Not found' });
 
-    if (record.id_photo_url) await deleteFromCloudinary(record.id_photo_url);
+    if (record.id_front_url) await deleteFromCloudinary(record.id_front_url);
+    if (record.id_back_url) await deleteFromCloudinary(record.id_back_url);
     if (record.selfie_photo_url) await deleteFromCloudinary(record.selfie_photo_url);
 
     await kyc.deleteOne({ _id: new ObjectId(req.params.id) });
@@ -1611,7 +1630,8 @@ app.delete('/api/admin/user/:id', auth, async (req, res) => {
 
     const userKyc = await kyc.find({ user_id: userId }).toArray();
     for (const k of userKyc) {
-      if (k.id_photo_url) await deleteFromCloudinary(k.id_photo_url);
+      if (k.id_front_url) await deleteFromCloudinary(k.id_front_url);
+      if (k.id_back_url) await deleteFromCloudinary(k.id_back_url);
       if (k.selfie_photo_url) await deleteFromCloudinary(k.selfie_photo_url);
     }
 
