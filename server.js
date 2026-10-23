@@ -796,7 +796,16 @@ app.post('/api/pwa/installed', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
-
+app.get('/api/lookup/:phone', async (req, res) => {
+  try {
+    const norm = normalizePhone(req.params.phone);
+    const user = await users.findOne({ phone: norm });
+    if (!user) return res.json({ found: false });
+    res.json({ found: true, user: { name: user.name, phone: user.phone, status: user.status || 'active' } });
+  } catch (e) {
+    res.json({ found: false });
+  }
+});
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v15-resend' }));
 // ============ MISSING ADMIN ROUTES ============
 
