@@ -806,6 +806,54 @@ app.get('/api/lookup/:phone', async (req, res) => {
     res.json({ found: false });
   }
 });
+app.post('/api/wallet/transfer', auth, async (req, res) => {
+  try {
+    const { phone, amount, note } = req.body;
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    const norm = normalizePhone(phone);
+    const sender = await getUserById(req.userId);
+    if (sender.phone === norm) return res.status(400).json({ error: "Can't send to self" });
+    if (sender.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
+
+    const recipient = await users.findOne({ phone: norm });
+    if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
+
+    await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
+    await users.updateOne({ _id: recipient._id }, { $inc: { balance: amt } });
+
+    await txs.insertOne({
+      user_id: req.userId,
+      type: 'transfer_out',
+      amount: amt,
+      description: `Sent to ${recipient.name}${note ? ' — ' + note : ''}`,
+      reference: makeRef(),
+      status: 'completed',
+      counterparty: recipient.name,
+      created_at: new Date(),
+    });
+
+    await txs.insertOne({
+      user_id: recipient._id.toString(),
+      type: 'transfer_in',
+      amount: amt,
+      description: `Received from ${sender.name}${note ? ' — ' + note : ''}`,
+      reference: makeRef(),
+      status: 'completed',
+      counterparty: sender.name,
+      created_at: new Date(),
+    });
+
+    notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`, recipient._id.toString());
+
+    const updated = await getUserById(req.userId);
+    res.json({ balance: updated.balance, recipient: { name: recipient.name, phone: recipient.phone } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Transfer failed' });
+  }
+});
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v15-resend' }));
 // ============ MISSING ADMIN ROUTES ============
 
