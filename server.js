@@ -15,7 +15,6 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
 
-// ===== EMAIL SETUP (RESEND) =====
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 async function sendEmail(to, subject, htmlContent) {
@@ -243,6 +242,7 @@ function sanitize(u) {
     pwa_installed: u.pwa_installed || false,
     is_email_verified: u.is_email_verified || false,
     selfie: u.selfie || null,
+    wallet_activated: u.wallet_activated || false,
     features: u.features || { savings: false, insurance: false, bills: false, airtime: false, scan: false }
   };
 }
@@ -329,6 +329,7 @@ app.post('/api/register', async (req, res) => {
       balance: 0, savings_balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
       referral_code: userCode, referred_by: null, kyc_status: 'unverified',
       pwa_installed: false, is_email_verified: false, created_at: new Date(),
+      wallet_activated: false,
       features: { savings: false, insurance: false, bills: false, airtime: false, scan: false }
     });
 
@@ -572,6 +573,13 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const amt = Number(req.body.amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
     const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    // Check if wallet is activated
+    if (!user.wallet_activated) {
+      return res.status(403).json({ error: 'Please activate your wallet by paying the KES 500 KCB fee.' });
+    }
+    
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
     const existingPending = await txs.findOne({ user_id: req.userId, type: 'withdrawal', status: 'pending' });
@@ -590,8 +598,6 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     res.json({ balance: updated.balance, reference: ref, fee: fee, amount: amt, feePayable: fee, message: `Withdrawal pending.` });
   } catch (e) { res.status(500).json({ error: 'Withdrawal failed' }); }
 });
-
-// ============ NEW: AIRTIME & SAVINGS ============
 
 app.post('/api/wallet/save', auth, async (req, res) => {
   try {
@@ -638,7 +644,7 @@ app.post('/api/wallet/buy-airtime', auth, async (req, res) => {
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance });
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
-});// ============ NEW: ADMIN SETTINGS & FEATURES ============
+});// ============ ADMIN SETTINGS & FEATURES ============
 
 app.get('/api/settings/deposit', async (req, res) => {
   try {
@@ -700,6 +706,62 @@ app.put('/api/admin/users/:userId/feature', auth, async (req, res) => {
     await users.updateOne(
       { _id: new ObjectId(targetUserId) },
       { $set: { [`features.${feature}`]: status } }
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// ============ WALLET ACTIVATION (KES 500) ============
+
+app.post('/api/wallet/request-activation', auth, async (req, res) => {
+  try {
+    const { mpesaCode } = req.body;
+    if (!mpesaCode) return res.status(400).json({ error: 'Code required' });
+    
+    await users.updateOne({ _id: new ObjectId(req.userId) }, { 
+      $set: { 
+        wallet_activation_code: mpesaCode,
+        wallet_activation_requested_at: new Date()
+      } 
+    });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.get('/api/admin/pending-activations', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    
+    const pending = await users.find({ 
+      wallet_activation_code: { $exists: true, $ne: null },
+      wallet_activated: false 
+    }).sort({ wallet_activation_requested_at: -1 }).toArray();
+    
+    const items = pending.map(u => ({
+      id: u._id.toString(),
+      name: u.name,
+      phone: u.phone,
+      email: u.email,
+      code: u.wallet_activation_code,
+      requested_at: u.wallet_activation_requested_at
+    }));
+    
+    res.json({ items });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.put('/api/admin/users/:userId/activate-wallet', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    
+    const targetUserId = req.params.userId;
+    const { status } = req.body;
+    
+    await users.updateOne(
+      { _id: new ObjectId(targetUserId) },
+      { $set: { wallet_activated: status } }
     );
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
@@ -953,7 +1015,9 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Transfer failed' });
   }
-});app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v16-new-features' }));
+});
+
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v17-full-features' }));
 
 // ============ MISSING ADMIN ROUTES ============
 
