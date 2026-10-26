@@ -328,7 +328,8 @@ app.post('/api/register', async (req, res) => {
       name, email: email.toLowerCase(), phone: norm, password_hash: hash,
       balance: 0, savings_balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
       referral_code: userCode, referred_by: null, kyc_status: 'unverified',
-      pwa_installed: false, is_email_verified: false, created_at: new Date(),
+      pwa_installed: false, is_email_verified: true, // <--- AUTO-VERIFIED NOW
+      created_at: new Date(),
       wallet_activated: false,
       features: { savings: false, insurance: false, bills: false, airtime: false, scan: false }
     });
@@ -336,6 +337,7 @@ app.post('/api/register', async (req, res) => {
     const newUserId = result.insertedId.toString();
     notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`, newUserId);
 
+    // (Referral logic stays the same)
     if (referral && String(referral).trim()) {
       const refCode = String(referral).trim().toUpperCase();
       const referrer = await users.findOne({ referral_code: refCode });
@@ -351,7 +353,12 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
-    res.json({ ok: true, message: 'Registered. Please verify OTP.', email: email });
+    // Generate the token immediately so they are logged in
+    const token = jwt.sign({ userId: newUserId }, JWT_SECRET, { expiresIn: '90d' });
+    const user = await users.findOne({ _id: result.insertedId });
+
+    // Return token and user to the frontend
+    res.json({ ok: true, token, user: sanitize(user) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Registration failed' });
