@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 const AfricasTalking = require('africastalking');
-const { Resend } = require('resend'); // RESEND INSTEAD OF BREVO/NODEMAILER
+const { Resend } = require('resend');
 
 const app = express();
 app.use(cors());
@@ -23,20 +23,17 @@ async function sendEmail(to, subject, htmlContent) {
     console.log('⚠️ Email skipped: RESEND_API_KEY not configured');
     return false;
   }
-
   try {
     const { data, error } = await resend.emails.send({
-      from: 'KCB Biashara Loans <info@biasharaloans.co.ke>', // Your verified domain
+      from: 'KCB Biashara Loans <info@biasharaloans.co.ke>',
       to: [to],
       subject: subject,
       html: htmlContent,
     });
-
     if (error) {
       console.error('📧 Resend API error:', error);
       return false;
     }
-
     console.log('📧 Email sent via Resend API:', data.id);
     return true;
   } catch (error) {
@@ -45,29 +42,9 @@ async function sendEmail(to, subject, htmlContent) {
   }
 }
 
-app.get('/api/test-loan', (req, res) => {
-  res.json({ ok: true, message: 'Loan endpoint test successful', timestamp: new Date().toISOString() });
-});
-
-app.get('/api/diagnostic', (req, res) => {
-  res.json({
-    ok: true,
-    deployed_at: new Date().toISOString(),
-    has_loan_apply_route: true,
-    has_admin_routes: true,
-    has_notifications: true,
-    has_fee_system: true,
-    has_kyc: true,
-    has_cloudinary: !!CLOUDINARY_CLOUD_NAME && !!CLOUDINARY_API_KEY,
-    has_email: !!process.env.RESEND_API_KEY,
-    version: 'v15-resend'
-  });
-});
-
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
-
 const REFERRAL_BONUS = 50;
 
 const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
@@ -199,7 +176,6 @@ async function deleteFromCloudinary(imageUrl) {
   }
 }
 
-// ===== HashPay STK Push =====
 async function initiateHashPayStk({ phone, amount, reference }) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
@@ -226,7 +202,9 @@ async function checkHashPayStatus(checkoutId) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
   });
   return await res.json();
-}let db, users, txs, loans, notifications, kyc;
+}
+
+let db, users, txs, loans, notifications, kyc, settings;
 
 async function connectDB() {
   const client = new MongoClient(MONGODB_URI);
@@ -237,6 +215,7 @@ async function connectDB() {
   loans = db.collection('loans');
   notifications = db.collection('notifications');
   kyc = db.collection('kyc');
+  settings = db.collection('settings');
   
   await users.createIndex({ email: 1 }, { unique: true });
   await users.createIndex({ phone: 1 }, { unique: true });
@@ -255,13 +234,16 @@ function sanitize(u) {
     email: u.email,
     phone: u.phone,
     balance: u.balance || 0,
+    savings_balance: u.savings_balance || 0,
     role: u.role || 'user',
     status: u.status || 'active',
     id_number: u.id_number || null,
     referral_code: u.referral_code || null,
     kyc_status: u.kyc_status || 'unverified',
     pwa_installed: u.pwa_installed || false,
-    is_email_verified: u.is_email_verified || false
+    is_email_verified: u.is_email_verified || false,
+    selfie: u.selfie || null,
+    features: u.features || { savings: false, insurance: false, bills: false, airtime: false, scan: false }
   };
 }
 
@@ -329,9 +311,7 @@ function buildSchedule(loan) {
     schedule.push({ month: i, due_date: dueDate, amount: loan.monthly, status: 'pending' });
   }
   return schedule;
-}
-
-// ============ AUTH & OTP ============
+}// ============ AUTH & OTP ============
 
 app.post('/api/register', async (req, res) => {
   try {
@@ -346,9 +326,10 @@ app.post('/api/register', async (req, res) => {
     const userCode = generateReferralCode(name);
     const result = await users.insertOne({
       name, email: email.toLowerCase(), phone: norm, password_hash: hash,
-      balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
+      balance: 0, savings_balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
       referral_code: userCode, referred_by: null, kyc_status: 'unverified',
       pwa_installed: false, is_email_verified: false, created_at: new Date(),
+      features: { savings: false, insurance: false, bills: false, airtime: false, scan: false }
     });
 
     const newUserId = result.insertedId.toString();
@@ -401,8 +382,6 @@ app.get('/api/me', auth, async (req, res) => {
   }
 });
 
-// ============ EMAIL OTP ============
-
 app.post('/api/auth/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
@@ -411,7 +390,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await users.updateOne({ _id: user._id }, { $set: { email_otp: otp, email_otp_expires: expiresAt } });
 
@@ -454,7 +433,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Verification failed' });
   }
-});// ============ KYC ============
+});
+
+// ============ KYC ============
 
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
@@ -479,7 +460,13 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     await kyc.deleteMany({ user_id: req.userId, status: 'pending' });
     const result = await kyc.insertOne(submission);
 
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { $set: { kyc_status: 'pending', kyc_submitted_at: new Date() } });
+    await users.updateOne({ _id: new ObjectId(req.userId) }, { 
+      $set: { 
+        kyc_status: 'pending', 
+        kyc_submitted_at: new Date(),
+        selfie: selfieUrl 
+      } 
+    });
     notify(user.phone, '📋 KYC Received', `Your identity verification has been received. We'll review it within 24 hours.`, req.userId);
 
     res.json({ ok: true, submissionId: result.insertedId.toString(), status: 'pending', message: 'KYC submitted successfully.' });
@@ -549,9 +536,7 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
     }
     res.json({ ok: true, status: newStatus });
   } catch (e) { res.status(500).json({ error: 'KYC review failed' }); }
-});
-
-// ============ NOTIFICATIONS & WALLET ============
+});// ============ NOTIFICATIONS & WALLET ============
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -606,6 +591,122 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Withdrawal failed' }); }
 });
 
+// ============ NEW: AIRTIME & SAVINGS ============
+
+app.post('/api/wallet/save', auth, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    
+    const user = await getUserById(req.userId);
+    if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
+
+    await users.updateOne(
+      { _id: new ObjectId(req.userId) }, 
+      { $inc: { balance: -amt, savings_balance: amt } }
+    );
+    
+    await txs.insertOne({
+      user_id: req.userId, type: 'withdrawal', amount: amt,
+      description: `Moved to savings`, reference: makeRef(),
+      status: 'completed', created_at: new Date(),
+    });
+
+    const updated = await getUserById(req.userId);
+    res.json({ balance: updated.balance, savings_balance: updated.savings_balance });
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.post('/api/wallet/buy-airtime', auth, async (req, res) => {
+  try {
+    const { phone, amount } = req.body;
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    
+    const user = await getUserById(req.userId);
+    if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
+
+    await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
+    
+    await txs.insertOne({
+      user_id: req.userId, type: 'withdrawal', amount: amt,
+      description: `Airtime purchase for ${phone}`, reference: makeRef(),
+      status: 'completed', created_at: new Date(),
+    });
+
+    const updated = await getUserById(req.userId);
+    res.json({ balance: updated.balance });
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});// ============ NEW: ADMIN SETTINGS & FEATURES ============
+
+app.get('/api/settings/deposit', async (req, res) => {
+  try {
+    let settingsDoc = await settings.findOne({ key: 'deposit' });
+    if (!settingsDoc) {
+      settingsDoc = { method: 'paybill', paybillNumber: '756756', paybillAccount: '1769003', tillNumber: '', sendMoneyNumber: '', sendMoneyName: '' };
+    }
+    res.json(settingsDoc);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.put('/api/admin/settings/deposit', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    
+    const { method, paybillNumber, paybillAccount, tillNumber, sendMoneyNumber, sendMoneyName } = req.body;
+    
+    await settings.updateOne(
+      { key: 'deposit' },
+      { $set: { method, paybillNumber, paybillAccount, tillNumber, sendMoneyNumber, sendMoneyName } },
+      { upsert: true }
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.get('/api/admin/lookup', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ error: 'Query required' });
+    
+    const norm = normalizePhone(query);
+    const user = await users.findOne({
+      $or: [
+        { phone: norm },
+        { phone: query },
+        { email: query.toLowerCase() },
+        { _id: ObjectId.isValid(query) ? new ObjectId(query) : null }
+      ]
+    });
+    
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: sanitize(user) });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+app.put('/api/admin/users/:userId/feature', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    
+    const targetUserId = req.params.userId;
+    const { feature, status } = req.body;
+    
+    await users.updateOne(
+      { _id: new ObjectId(targetUserId) },
+      { $set: { [`features.${feature}`]: status } }
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// ============ HASHPAY ============
+
 app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
   try {
     const { reference, phone } = req.body;
@@ -658,7 +759,9 @@ app.post('/api/hashpay/webhook', async (req, res) => {
     await txs.updateOne({ _id: tx._id }, { $set: { fee_paid: true, fee_paid_at: new Date(), fee_receipt: receipt, fee_amount: amount, description: 'Withdrawal to M-Pesa — Fee Paid, Awaiting Payout' } });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Webhook failed' }); }
-});app.get('/api/loans', auth, async (req, res) => {
+});// ============ LOANS ============
+
+app.get('/api/loans', auth, async (req, res) => {
   try {
     const list = await loans.find({ user_id: req.userId }).sort({ created_at: -1 }).toArray();
     res.json({ loans: list.map(formatLoan) });
@@ -679,7 +782,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // 1. STRICT BACKEND VALIDATION
     const phoneRegex = /^(?:\+?254|0)?(7|1)\d{8}$/;
     if (!phone || !phoneRegex.test(phone)) return res.status(400).json({ error: 'Invalid phone number format.' });
 
@@ -696,11 +798,9 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount.' });
     if (!mnths || mnths <= 0) return res.status(400).json({ error: 'Invalid months.' });
 
-    // 2. CHECK FOR EXISTING ACTIVE/PENDING LOANS
     const existingLoan = await loans.findOne({ user_id: req.userId, status: { $in: ['pending', 'active'] } });
     if (existingLoan) return res.status(400).json({ error: 'You already have an active or pending loan.' });
 
-    // 3. CALCULATE LOAN DETAILS
     const kycStatus = user.kyc_status || 'unverified';
     const rate = 10;
     const r = rate / 100 / 12;
@@ -713,7 +813,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     const dueDate = new Date();
     dueDate.setMonth(dueDate.getMonth() + mnths);
 
-    // 4. SAVE TO DATABASE
     const result = await loans.insertOne({
       user_id: req.userId, amount: amt, months: mnths, rate, monthly, total,
       interest: total - amt, paid: 0, status: 'pending', purpose: purpose || 'Business Loan',
@@ -754,7 +853,6 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
     if (user) {
       notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved.`, loan.user_id);
       
-      // SEND APPROVAL EMAIL
       const emailHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
           <h2 style="color: #22c55e; text-align: center;">🎉 Loan Approved!</h2>
@@ -796,6 +894,7 @@ app.post('/api/pwa/installed', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
+
 app.get('/api/lookup/:phone', async (req, res) => {
   try {
     const norm = normalizePhone(req.params.phone);
@@ -806,6 +905,7 @@ app.get('/api/lookup/:phone', async (req, res) => {
     res.json({ found: false });
   }
 });
+
 app.post('/api/wallet/transfer', auth, async (req, res) => {
   try {
     const { phone, amount, note } = req.body;
@@ -853,11 +953,10 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Transfer failed' });
   }
-});
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v15-resend' }));
+});app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v16-new-features' }));
+
 // ============ MISSING ADMIN ROUTES ============
 
-// 1. Withdrawals
 app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -938,7 +1037,6 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   }
 });
 
-// 2. Cleanup & Stats
 app.get('/api/admin/storage-stats', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1032,7 +1130,6 @@ app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
   }
 });
 
-// 3. PWA Installs
 app.get('/api/admin/pwa-installs', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
