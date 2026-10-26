@@ -446,6 +446,9 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
 
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    // BLOCK PENDING AND VERIFIED SUBMISSIONS
+    if (user.kyc_status === 'pending') return res.status(400).json({ error: 'Your KYC is already under review. Please wait for approval.' });
     if (user.kyc_status === 'verified') return res.status(400).json({ error: 'Your KYC is already verified' });
 
     const idFrontUrl = await uploadToCloudinary(idFrontPhoto);
@@ -575,7 +578,7 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
     
-    // Check if wallet is activated
+    // CHECK IF WALLET IS ACTIVATED
     if (!user.wallet_activated) {
       return res.status(403).json({ error: 'Please activate your wallet by paying the KES 500 KCB fee.' });
     }
@@ -1017,7 +1020,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v17-full-features' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v18-kyc-fix' }));
 
 // ============ MISSING ADMIN ROUTES ============
 
