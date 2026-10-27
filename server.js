@@ -82,25 +82,38 @@ async function sendSMS(phone, message) {
     return false;
   }
 }
-
 // Replaced OneSignal Push with PushAlert API
 async function sendPush(phone, title, message) {
-  if (!PUSHALERT_API_KEY) return;
+  if (!PUSHALERT_API_KEY) {
+    console.warn('⚠️ PushAlert skipped: PUSHALERT_API_KEY not configured');
+    return;
+  }
   try {
     const payload = new URLSearchParams();
     payload.append('title', title);
     payload.append('message', message);
-    payload.append('target_url', 'https://biasharaloans.co.ke');
+    payload.append('url', 'https://biasharaloans.co.ke');
 
-    const res = await fetch('https://api.pushalert.co/v2/send', {
+    // Correct PushAlert v2 Web Push endpoint
+    const res = await fetch('https://api.pushalert.co/rest/v2/web-push/send', {
       method: 'POST',
       headers: {
         'Authorization': `api_key=${PUSHALERT_API_KEY}`,
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: payload
+      body: payload.toString()
     });
-    return await res.json();
+    
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      if (!data.success) {
+        console.error('PushAlert API Error:', data);
+      }
+      return data;
+    } catch (parseError) {
+      console.error('PushAlert returned non-JSON response:', text.substring(0, 200));
+    }
   } catch(e) {
     console.error('Push failed:', e.message);
   }
