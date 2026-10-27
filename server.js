@@ -225,10 +225,6 @@ app.post('/api/register', async (req, res) => {
     });
 
     const newUserId = result.insertedId.toString();
-    
-    // SMS 1: Welcome/Registration (Optional: remove if you want strictly 3 SMS)
-    // await sendSMS(norm, `Welcome to Biashara Boost, ${name.split(' ')[0]}. Your loan wallet is successfully created.`);
-    
     notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`, newUserId);
 
     if (referral && String(referral).trim()) {
@@ -267,6 +263,13 @@ app.get('/api/me', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const list = await notifications.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(50).toArray();
+    res.json({ items: list, unreadCount: list.filter(n => !n.read).length });
+  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
 // ============ KYC ============
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
@@ -279,136 +282,122 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     const idBackUrl = await uploadToCloudinary(idBackPhoto);
     const selfieUrl = await uploadToCloudinary(selfiePhoto);
 
-    const submission = { user_id: req.userId, full_name: fullName, id_number: idNumber, dob: dob || null, id_front_url: idFrontUrl, id_back_url: idBackUrl, selfie_photo_url: selfieUrl, status: 'pending', submitted_at: new Date(), reviewed_at: null, reviewed_by: null, rejection_reason: null };
     await kyc.deleteMany({ user_id: req.userId, status: 'pending' });
-    const result = await kyc.insertOne(submission);
+    await kyc.insertOne({ user_id: req.userId, full_name: fullName, id_number: idNumber, dob, id_front_url: idFrontUrl, id_back_url: idBackUrl, selfie_photo_url: selfieUrl, status: 'pending', submitted_at: new Date() });
 
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { $set: { kyc_status: 'pending', kyc_submitted_at: new Date(), selfie: selfieUrl } });
-    notify(user.phone, '📋 KYC Received', `Your identity verification has been received. We'll review it within 24 hours.`, req.userId);
+    await users.updateOne({ _id: new ObjectId(req.userId) }, { $set: { kyc_status: 'pending', selfie: selfieUrl } });
+    notify(user.phone, '📋 KYC Received', `Your identity verification has been received.`, req.userId);
 
-    res.json({ ok: true, submissionId: result.insertedId.toString(), status: 'pending', message: 'KYC submitted successfully.' });
+    res.json({ ok: true, message: 'KYC submitted successfully.' });
   } catch (e) { res.status(500).json({ error: 'KYC submission failed: ' + e.message }); }
 });
 
 app.get('/api/admin/pending-kyc', auth, async (req, res) => {
-  try {
-    const admin = await getUserById(req.userId);
-    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    const pending = await kyc.aggregate([
-      { $match: { status: 'pending' } }, { $sort: { submitted_at: -1 } },
-      { $lookup: { from: 'users', let: { uid: '$user_id' }, pipeline: [{ $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } }, { $project: { name: 1, phone: 1, email: 1 } }], as: 'user' } },
-      { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } }, { $limit: 100 }
-    ]).toArray();
-    const items = pending.map(k => ({ id: k._id.toString(), full_name: k.full_name, id_number: k.id_number, dob: k.dob, id_front_url: k.id_front_url, id_back_url: k.id_back_url, selfie_photo_url: k.selfie_photo_url, submitted_at: k.submitted_at, user: k.user }));
-    res.json({ items });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+  const pending = await kyc.aggregate([
+    { $match: { status: 'pending' } }, { $sort: { submitted_at: -1 } },
+    { $lookup: { from: 'users', let: { uid: '$user_id' }, pipeline: [{ $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$uid'] } } }], as: 'user' } },
+    { $unwind: '$user' }
+  ]).toArray();
+  res.json({ items: pending });
 });
 
 app.post('/api/admin/approve-kyc', auth, async (req, res) => {
-  try {
-    const admin = await getUserById(req.userId);
-    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    const { kycId, action, reason } = req.body;
-    const submission = await kyc.findOne({ _id: new ObjectId(kycId) });
-    const newStatus = action === 'approve' ? 'verified' : 'rejected';
-    await kyc.updateOne({ _id: new ObjectId(kycId) }, { $set: { status: newStatus, reviewed_at: new Date(), rejection_reason: reason } });
-    await users.updateOne({ _id: new ObjectId(submission.user_id) }, { $set: { kyc_status: newStatus } });
-    res.json({ ok: true, status: newStatus });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
-});// ============ WALLET & SMS ============
-
+  const { kycId, action, reason } = req.body;
+  const submission = await kyc.findOne({ _id: new ObjectId(kycId) });
+  const newStatus = action === 'approve' ? 'verified' : 'rejected';
+  await kyc.updateOne({ _id: new ObjectId(kycId) }, { $set: { status: newStatus, reason } });
+  await users.updateOne({ _id: new ObjectId(submission.user_id) }, { $set: { kyc_status: newStatus } });
+  res.json({ ok: true });
+});// ============ WALLET & DYNAMIC KCB SMS ============
 app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
   try {
     const { amount } = req.body;
     const user = await getUserById(req.userId);
     
-    // Fetch dynamic settings
+    // Fetch dynamic settings from Admin
     let settingsDoc = await settings.findOne({ key: 'deposit' });
-    let payInfo = '';
-    if (settingsDoc && settingsDoc.method === 'paybill') {
-      payInfo = `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}`;
-    } else if (settingsDoc && settingsDoc.method === 'till') {
-      payInfo = `Till ${settingsDoc.tillNumber}`;
-    } else {
-      payInfo = 'the provided payment details';
-    }
+    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
+      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
+      : `Till ${settingsDoc.tillNumber}`;
 
-    // SMS 3: KCB Fee details
+    // SMS 3: KCB Fee Instruction
     await sendSMS(user.phone, `BIASHARA LOANS: To withdraw KES ${Number(amount).toLocaleString()}, pay the KCB fee of KES 500 via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
-    
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
-  try {
-    const list = await txs.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(100).toArray();
-    res.json({ txs: list.map(t => ({ id: t._id.toString(), type: t.type, amount: t.amount, fee: t.fee || null, description: t.description, reference: t.reference, status: t.status, mpesa_receipt: t.mpesa_receipt || null, created_at: t.created_at })) });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+  const list = await txs.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(100).toArray();
+  res.json({ txs: list });
+});
+
+app.post('/api/wallet/deposit', auth, async (req, res) => {
+  const amt = Number(req.body.amount);
+  const me = await getUserById(req.userId);
+  if (!me || me.role !== 'admin') return res.status(403).json({ error: 'Only admins can deposit' });
+  await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: amt } });
+  res.json({ balance: me.balance + amt });
 });
 
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
-  try {
-    const amt = Number(req.body.amount);
-    const user = await getUserById(req.userId);
-    if (!user.wallet_activated) return res.status(403).json({ error: 'Please activate your wallet by paying the KES 500 fee.' });
-    if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
+  const amt = Number(req.body.amount);
+  const user = await getUserById(req.userId);
+  
+  if (!user.wallet_activated) return res.status(403).json({ error: 'Please activate your wallet by paying the KES 500 fee.' });
+  if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
-    const fee = 400; 
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
-    const ref = makeRef();
-    await txs.insertOne({ user_id: req.userId, type: 'withdrawal', amount: amt, fee: fee, description: 'Withdrawal Pending', reference: ref, status: 'pending', created_at: new Date() });
-    
-    notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending.`, req.userId);
-    res.json({ balance: user.balance - amt, reference: ref, fee: fee, amount: amt });
-  } catch (e) { res.status(500).json({ error: 'Withdrawal failed' }); }
+  await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
+  const ref = makeRef();
+  
+  await txs.insertOne({ user_id: req.userId, type: 'withdrawal', amount: amt, fee: 500, description: 'Withdrawal Pending', reference: ref, status: 'pending', created_at: new Date() });
+  notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending.`, req.userId);
+  
+  res.json({ balance: user.balance - amt, reference: ref });
 });
 
 app.post('/api/wallet/save', auth, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const user = await getUserById(req.userId);
-    if (user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amount, savings_balance: amount } });
-    res.json({ balance: user.balance - amount, savings_balance: (user.savings_balance || 0) + Number(amount) });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+  const { amount } = req.body;
+  await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amount, savings_balance: amount } });
+  res.json({ ok: true });
 });
 
 app.post('/api/wallet/buy-airtime', auth, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const user = await getUserById(req.userId);
-    if (user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amount } });
-    res.json({ balance: user.balance - amount });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+  const { amount } = req.body;
+  await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amount } });
+  res.json({ ok: true });
 });
 
-// ============ ADMIN SETTINGS & ACTIVATION ============
+app.get('/api/lookup/:phone', async (req, res) => {
+  const user = await users.findOne({ phone: normalizePhone(req.params.phone) });
+  if (!user) return res.json({ found: false });
+  res.json({ found: true, user: { name: user.name, phone: user.phone } });
+});
+
+app.post('/api/wallet/transfer', auth, async (req, res) => {
+  const { phone, amount } = req.body;
+  const sender = await getUserById(req.userId);
+  const recipient = await users.findOne({ phone: normalizePhone(phone) });
+  if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
+  await users.updateOne({ _id: sender._id }, { $inc: { balance: -amount } });
+  await users.updateOne({ _id: recipient._id }, { $inc: { balance: amount } });
+  res.json({ ok: true });
+});// ============ ADMIN SETTINGS & ACTIVATION ============
 app.get('/api/settings/deposit', async (req, res) => {
   let s = await settings.findOne({ key: 'deposit' });
-  if (!s) s = { method: 'paybill', paybillNumber: '756756', paybillAccount: '1769003' };
-  res.json(s);
+  res.json(s || { method: 'paybill', paybillNumber: '756756', paybillAccount: '1769003' });
 });
 
 app.put('/api/admin/settings/deposit', auth, async (req, res) => {
-  const admin = await getUserById(req.userId);
-  if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
   await settings.updateOne({ key: 'deposit' }, { $set: req.body }, { upsert: true });
   res.json({ ok: true });
 });
 
 app.get('/api/admin/lookup', auth, async (req, res) => {
-  const admin = await getUserById(req.userId);
-  if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
   const user = await users.findOne({ $or: [{ phone: normalizePhone(req.query.q) }, { email: req.query.q.toLowerCase() }] });
-  if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({ user: sanitize(user) });
 });
 
 app.put('/api/admin/users/:userId/feature', auth, async (req, res) => {
-  const admin = await getUserById(req.userId);
-  if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
   await users.updateOne({ _id: new ObjectId(req.params.userId) }, { $set: { [`features.${req.body.feature}`]: req.body.status } });
   res.json({ ok: true });
 });
@@ -420,41 +409,43 @@ app.post('/api/wallet/request-activation', auth, async (req, res) => {
 
 app.get('/api/admin/pending-activations', auth, async (req, res) => {
   const pending = await users.find({ wallet_activation_code: { $exists: true }, wallet_activated: false }).toArray();
-  res.json({ items: pending.map(u => ({ id: u._id.toString(), name: u.name, phone: u.phone, email: u.email, code: u.wallet_activation_code })) });
+  res.json({ items: pending });
 });
 
 app.put('/api/admin/users/:userId/activate-wallet', auth, async (req, res) => {
   await users.updateOne({ _id: new ObjectId(req.params.userId) }, { $set: { wallet_activated: req.body.status } });
   res.json({ ok: true });
-});// ============ LOANS ============
+});
+
+// ============ LOANS (SMS 1 & SMS 2) ============
 app.get('/api/loans', auth, async (req, res) => {
   const list = await loans.find({ user_id: req.userId }).sort({ created_at: -1 }).toArray();
   res.json({ loans: list.map(formatLoan) });
 });
 
+app.get('/api/loans/:id', auth, async (req, res) => {
+  const loan = await loans.findOne({ _id: new ObjectId(req.params.id) });
+  res.json({ loan: formatLoan(loan), schedule: buildSchedule(loan) });
+});
+
 app.post('/api/loans/apply', auth, async (req, res) => {
-  try {
-    const { fullName, phone, email, amount, months, purpose, employment, idNumber, consent } = req.body;
-    const user = await getUserById(req.userId);
-    const amt = Number(amount);
-    
-    const existingLoan = await loans.findOne({ user_id: req.userId, status: { $in: ['pending', 'active'] } });
-    if (existingLoan) return res.status(400).json({ error: 'You already have an active or pending loan.' });
+  const { fullName, phone, email, amount, months, purpose, employment, idNumber } = req.body;
+  const amt = Number(amount);
+  
+  const existingLoan = await loans.findOne({ user_id: req.userId, status: { $in: ['pending', 'active'] } });
+  if (existingLoan) return res.status(400).json({ error: 'You already have an active or pending loan.' });
 
-    const rate = 10; const r = rate / 100 / 12;
-    const monthly = Math.round(amt * r * Math.pow(1 + r, months) / (Math.pow(1 + r, months) - 1));
-    const total = monthly * months;
+  const monthly = Math.round((amt * (0.10/12) * Math.pow(1 + (0.10/12), months)) / (Math.pow(1 + (0.10/12), months) - 1));
+  const total = monthly * months;
 
-    const result = await loans.insertOne({
-      user_id: req.userId, amount: amt, months, rate, monthly, total, interest: total - amt, paid: 0, status: 'pending', purpose, employment, id_number: idNumber, full_name: fullName, phone, email, created_at: new Date()
-    });
+  const result = await loans.insertOne({
+    user_id: req.userId, amount: amt, months, monthly, total, status: 'pending', purpose, employment, id_number: idNumber, full_name: fullName, phone, email, created_at: new Date()
+  });
 
-    // SMS 1: Application Received
-    await sendSMS(user.phone, `BIASHARA LOANS: We have received your loan application of KES ${amt.toLocaleString()}. We will notify you once it has been reviewed.`);
-    notify(user.phone, '📝 Application Received', `We received your loan application for KES ${amt.toLocaleString()}.`, req.userId);
-    
-    res.json({ ok: true, loanId: result.insertedId.toString() });
-  } catch (e) { res.status(500).json({ error: 'Loan failed' }); }
+  // SMS 1: Application Received
+  await sendSMS(phone, `BIASHARA LOANS: We have received your loan application of KES ${amt.toLocaleString()}. We will notify you once it has been reviewed.`);
+  
+  res.json({ ok: true, loanId: result.insertedId.toString() });
 });
 
 app.get('/api/admin/pending-loans', auth, async (req, res) => {
@@ -463,40 +454,17 @@ app.get('/api/admin/pending-loans', auth, async (req, res) => {
 });
 
 app.post('/api/admin/approve-loan', auth, async (req, res) => {
-  try {
-    const loan = await loans.findOne({ _id: new ObjectId(req.body.loanId) });
-    await loans.updateOne({ _id: loan._id }, { $set: { status: 'active', approved_at: new Date() } });
-    const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
-    
-    // SMS 2: Loan Approved
-    await sendSMS(user.phone, `BIASHARA LOANS: Congratulations! Your loan of KES ${loan.amount.toLocaleString()} is approved. Check your account for details.`);
-    notify(user.phone, '🎉 Loan Approved!', `Your loan is approved.`, loan.user_id);
-
-    // Email
-    const html = `<h2>Loan Approved!</h2><p>Your loan of KES ${loan.amount} is ready.</p>`;
-    await sendEmail(user.email, 'Your Loan Has Been Approved! 🎉', html);
-    
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// ============ PUBLIC & MISC ============
-app.post('/api/pwa/installed', auth, async (req, res) => {
-  await users.updateOne({ _id: new ObjectId(req.userId) }, { $set: { pwa_installed: true } });
-  res.json({ ok: true });
-});
-
-app.post('/api/wallet/transfer', auth, async (req, res) => {
-  const { phone, amount } = req.body;
-  const sender = await getUserById(req.userId);
-  const recipient = await users.findOne({ phone: normalizePhone(phone) });
-  if (!recipient) return res.status(404).json({ error: 'Recipient not found' });
-  if (sender.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
+  const loan = await loans.findOne({ _id: new ObjectId(req.body.loanId) });
+  await loans.updateOne({ _id: loan._id }, { $set: { status: 'active', approved_at: new Date() } });
+  const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
   
-  await users.updateOne({ _id: sender._id }, { $inc: { balance: -amount } });
-  await users.updateOne({ _id: recipient._id }, { $inc: { balance: amount } });
-  res.json({ balance: sender.balance - amount });
-});// ============ ADMIN WITHDRAWALS ============
+  // SMS 2: Loan Approved
+  await sendSMS(user.phone, `BIASHARA LOANS: Congratulations! Your loan of KES ${loan.amount.toLocaleString()} is approved. Check your account for details.`);
+  
+  await sendEmail(user.email, 'Your Loan Has Been Approved! 🎉', `<h2>Loan Approved!</h2><p>Your loan of KES ${loan.amount} is ready.</p>`);
+  
+  res.json({ ok: true });
+});// ============ ADMIN WITHDRAWALS (Option 3 SMS) ============
 app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
   const pending = await txs.aggregate([
     { $match: { type: 'withdrawal', status: 'pending' } },
@@ -510,44 +478,45 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   try {
     const { txId, mpesaReceipt } = req.body;
     const tx = await txs.findOne({ _id: new ObjectId(txId) });
-    
     await txs.updateOne({ _id: tx._id }, { $set: { status: 'completed', mpesa_receipt: mpesaReceipt } });
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
 
-    // SMS 4: Funds Disbursed (Option 3)
+    // SMS 3 (Option 3 - Disbursement)
     await sendSMS(user.phone, `BIASHARA LOANS: KES ${tx.amount.toLocaleString()} has been disbursed to your wallet. Log in to confirm receipt and check repayment details.`);
-    notify(user.phone, '✅ Withdrawal Complete', `Funds sent to your M-Pesa. Receipt: ${mpesaReceipt}`, tx.user_id);
-
+    
     res.json({ ok: true, receipt: mpesaReceipt });
   } catch (e) { res.status(500).json({ error: 'Approval failed' }); }
 });
 
-// ============ CLEANUP & STATS ============
+// ============ HASHPAY ============
+app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
+  const { reference, phone } = req.body;
+  await initiateHashPayStk({ phone, amount: 500, reference });
+  res.json({ ok: true });
+});
+
+// ============ CLEANUP & MISC ============
+app.get('/api/public/activity', async (req, res) => {
+  const items = await txs.find({ status: 'completed', type: 'withdrawal' }).limit(10).toArray();
+  res.json({ items });
+});
+
+app.post('/api/pwa/installed', auth, async (req, res) => {
+  await users.updateOne({ _id: new ObjectId(req.userId) }, { $set: { pwa_installed: true } });
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/storage-stats', auth, async (req, res) => {
   const counts = await Promise.all([users.countDocuments(), txs.countDocuments(), loans.countDocuments(), kyc.countDocuments()]);
   res.json({ users: counts[0], transactions: counts[1], loans: counts[2], kyc: counts[3] });
 });
 
-app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
-  const targets = await kyc.find({ status: 'verified' }).limit(100).toArray();
-  for (const t of targets) {
-    if (t.id_front_url) await deleteFromCloudinary(t.id_front_url);
-    await kyc.updateOne({ _id: t._id }, { $set: { id_front_url: null } });
-  }
-  res.json({ ok: true });
-});
-
-app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
-  await notifications.deleteMany({ created_at: { $lt: new Date(Date.now() - 30*24*60*60*1000) } });
-  res.json({ ok: true });
-});
-
 app.get('/api/admin/pwa-installs', auth, async (req, res) => {
   const installed = await users.find({ pwa_installed: true }).toArray();
-  res.json({ items: installed, total: installed.length });
+  res.json({ items: installed });
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: 'v19-connectmedia' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: 'v20-complete' }));
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
