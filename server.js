@@ -45,7 +45,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 const REFERRAL_BONUS = 50;
 
-// Replaced OneSignal with PushAlert
+// PUSHALERT SETUP
 const PUSHALERT_API_KEY = process.env.PUSHALERT_API_KEY || '';
 
 function normalizePhone(input) {
@@ -82,30 +82,45 @@ async function sendSMS(phone, message) {
     return false;
   }
 }
-// Replaced OneSignal Push with PushAlert API
+
+// PUSHALERT API INTEGRATION
 async function sendPush(phone, title, message) {
-  const apiKey = process.env.PUSHALERT_API_KEY;
-  if (!apiKey) return;
+  if (!PUSHALERT_API_KEY) {
+    console.warn('⚠️ PushAlert skipped: PUSHALERT_API_KEY not configured');
+    return;
+  }
   try {
-    // Note: PushAlert typically uses subscriber IDs, so if you are targeting by phone, 
-    // you need to ensure your frontend is sending the phone number to PushAlert as a custom ID.
-    const res = await fetch('https://api.pushalert.co/v1/push', {
+    const payload = new URLSearchParams();
+    payload.append('title', title);
+    payload.append('message', message);
+    payload.append('url', 'https://biasharaloans.co.ke');
+
+    const res = await fetch('https://api.pushalert.co/rest/v2/web-push/send', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `api_key=${apiKey}`
+        'Authorization': `api_key=${PUSHALERT_API_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: JSON.stringify({
-        title: title,
-        message: message,
-        // You'll need to adapt this based on how PushAlert handles targeting
-      })
+      body: payload.toString()
     });
-    return await res.json();
+    
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      if (!data.success) {
+        console.error('PushAlert API Error:', data);
+      } else {
+        console.log('✅ PushAlert sent successfully!');
+      }
+      return data;
+    } catch (parseError) {
+      console.error('PushAlert returned non-JSON response:', text.substring(0, 200));
+    }
   } catch(e) {
     console.error('Push failed:', e.message);
   }
 }
+
 // PUSH + DB ONLY (NO SMS HERE)
 async function notify(phone, title, message, userId) {
   await Promise.allSettled([
@@ -330,7 +345,7 @@ app.post('/api/register', async (req, res) => {
       name, email: email.toLowerCase(), phone: norm, password_hash: hash,
       balance: 0, savings_balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
       referral_code: userCode, referred_by: null, kyc_status: 'unverified',
-      pwa_installed: false, is_email_verified: true, // <--- AUTO-VERIFIED NOW
+      pwa_installed: false, is_email_verified: true,
       created_at: new Date(),
       wallet_activated: false,
       features: { savings: false, insurance: false, bills: false, airtime: false, scan: false }
@@ -586,7 +601,6 @@ app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
       ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
       : `Till ${settingsDoc.tillNumber}`;
 
-    // Send the SMS
     await sendSMS(user.phone, `BIASHARA LOANS: To withdraw KES ${Number(amount).toLocaleString()}, pay the KCB fee of KES 500 via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
     
     res.json({ ok: true });
@@ -597,13 +611,11 @@ app.post('/api/wallet/activation-sms', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     
-    // Fetch the latest payment settings from the Admin Panel
     let settingsDoc = await settings.findOne({ key: 'deposit' });
     let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
       ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
       : `Till ${settingsDoc.tillNumber}`;
 
-    // Send the SMS (UPDATED WORDING)
     await sendSMS(user.phone, `BIASHARA LOANS: Make your first deposit of KES 500 to activate your account via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
     
     res.json({ ok: true });
@@ -919,7 +931,6 @@ app.post('/api/loans/apply', auth, async (req, res) => {
       phone: phone, email: email, kyc_status_at_apply: kycStatus, created_at: new Date(), due_date: dueDate,
     });
 
-    // SMS 1: Application Received
     await sendSMS(user.phone, `BIASHARA LOANS: We have received your loan application of KES ${amt.toLocaleString()}. We will notify you once it has been reviewed.`);
     
     notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}.`, req.userId);
@@ -953,7 +964,6 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
     if (user) {
-      // SMS 2: Loan Approved
       await sendSMS(user.phone, `BIASHARA LOANS: Congratulations! Your loan of KES ${loan.amount.toLocaleString()} is approved. Check your account for details.`);
       
       notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved.`, loan.user_id);
@@ -1058,7 +1068,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v18-kyc-fix' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v19-pushalert-fix' }));
 
 // ============ MISSING ADMIN ROUTES ============
 
@@ -1132,7 +1142,6 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
-      // SMS 3: Disbursed (Option 3)
       await sendSMS(user.phone, `BIASHARA LOANS: KES ${tx.amount.toLocaleString()} has been disbursed to your wallet. Log in to confirm receipt and check repayment details.`);
       
       notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`, tx.user_id);
@@ -1231,7 +1240,7 @@ app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
       created_at: { $lt: cutoff }
     });
 
-    res.json({ ok: true, deleted: result.deletedCount, days: days });
+      res.json({ ok: true, deleted: result.deletedCount, days: days });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Cleanup failed' });
