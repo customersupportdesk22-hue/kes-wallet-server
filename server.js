@@ -4,7 +4,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
-const AfricasTalking = require('africastalking');
 const { Resend } = require('resend');
 
 const app = express();
@@ -46,17 +45,6 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 const REFERRAL_BONUS = 50;
 
-const AT_USERNAME = process.env.AT_USERNAME || 'biasharasms';
-const AT_API_KEY = process.env.AT_API_KEY || '';
-let atSms = null;
-try {
-  const at = AfricasTalking({ username: AT_USERNAME, apiKey: AT_API_KEY });
-  atSms = at.SMS;
-  console.log("Africa's Talking initialized");
-} catch(e) {
-  console.log('AT init failed:', e.message);
-}
-
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
 const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY || '';
 
@@ -68,13 +56,43 @@ function normalizePhone(input) {
   return p;
 }
 
+// ===== CONNECT MEDIA SMS =====
 async function sendSMS(phone, message) {
-  if (!atSms || !AT_API_KEY) return;
+  const apiKey = process.env.CONNECTMEDIA_API_KEY;
+  if (!apiKey) {
+    console.log('⚠️ SMS skipped: CONNECTMEDIA_API_KEY not configured');
+    return false;
+  }
+
   try {
-    const to = '+' + normalizePhone(phone);
-    return await atSms.send({ to: [to], message });
-  } catch(e) {
-    console.error('SMS failed:', e.message);
+    const recipient = normalizePhone(phone);
+    
+    const res = await fetch('https://app.connectmedia.co.ke/api.php', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'send',
+        to: recipient,
+        message: message,
+        sender: 'ConectMedia'
+      }),
+    });
+
+    const body = await res.json();
+
+    if (body.code !== '201') {
+      console.error('📱 Connect Media API Error:', body.message);
+      return false;
+    }
+    
+    console.log('📱 SMS sent via Connect Media successfully');
+    return true;
+  } catch (error) {
+    console.error('📱 SMS failed:', error);
+    return false;
   }
 }
 
@@ -387,59 +405,6 @@ app.get('/api/me', auth, async (req, res) => {
     res.json({ user: sanitize(user) });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
-  }
-});
-
-app.post('/api/auth/send-otp', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
-    const user = await users.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-    await users.updateOne({ _id: user._id }, { $set: { email_otp: otp, email_otp_expires: expiresAt } });
-
-    const html = `
-      <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
-        <h2 style="color: #007AFF; text-align: center;">Verify Your Email</h2>
-        <p>Hello ${user.name.split(' ')[0]},</p>
-        <p>Use the verification code below to complete your registration on Biashara Boost Loans.</p>
-        <div style="background: #f0f2f5; padding: 15px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; color: #333; margin: 20px 0; border-radius: 8px;">${otp}</div>
-        <p style="color: #666; font-size: 12px;">This code expires in 10 minutes.</p>
-      </div>
-    `;
-
-    const sent = await sendEmail(user.email, 'Your Verification Code - Biashara Boost', html);
-    if (!sent) {
-      return res.status(500).json({ error: 'Failed to send email' });
-    }
-    
-    res.json({ ok: true, message: 'OTP sent to email' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to send OTP' });
-  }
-});
-
-app.post('/api/auth/verify-otp', async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    const user = await users.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    if (String(user.email_otp) !== String(otp)) return res.status(400).json({ error: 'Invalid verification code' });
-    if (new Date() > new Date(user.email_otp_expires)) return res.status(400).json({ error: 'Verification code has expired' });
-
-    await users.updateOne({ _id: user._id }, { $set: { is_email_verified: true }, $unset: { email_otp: 1, email_otp_expires: 1 } });
-    
-    const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: '90d' });
-    res.json({ ok: true, token, user: sanitize(user), message: 'Email verified successfully' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Verification failed' });
   }
 });
 
