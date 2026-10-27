@@ -84,41 +84,28 @@ async function sendSMS(phone, message) {
 }
 // Replaced OneSignal Push with PushAlert API
 async function sendPush(phone, title, message) {
-  if (!PUSHALERT_API_KEY) {
-    console.warn('⚠️ PushAlert skipped: PUSHALERT_API_KEY not configured');
-    return;
-  }
+  const apiKey = process.env.PUSHALERT_API_KEY;
+  if (!apiKey) return;
   try {
-    const payload = new URLSearchParams();
-    payload.append('title', title);
-    payload.append('message', message);
-    payload.append('url', 'https://biasharaloans.co.ke');
-
-    // Correct PushAlert v2 Web Push endpoint
-    const res = await fetch('https://api.pushalert.co/rest/v2/web-push/send', {
+    // Note: PushAlert typically uses subscriber IDs, so if you are targeting by phone, 
+    // you need to ensure your frontend is sending the phone number to PushAlert as a custom ID.
+    const res = await fetch('https://api.pushalert.co/v1/push', {
       method: 'POST',
       headers: {
-        'Authorization': `api_key=${PUSHALERT_API_KEY}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/json',
+        'Authorization': `api_key=${apiKey}`
       },
-      body: payload.toString()
+      body: JSON.stringify({
+        title: title,
+        message: message,
+        // You'll need to adapt this based on how PushAlert handles targeting
+      })
     });
-    
-    const text = await res.text();
-    try {
-      const data = JSON.parse(text);
-      if (!data.success) {
-        console.error('PushAlert API Error:', data);
-      }
-      return data;
-    } catch (parseError) {
-      console.error('PushAlert returned non-JSON response:', text.substring(0, 200));
-    }
+    return await res.json();
   } catch(e) {
     console.error('Push failed:', e.message);
   }
 }
-
 // PUSH + DB ONLY (NO SMS HERE)
 async function notify(phone, title, message, userId) {
   await Promise.allSettled([
