@@ -45,8 +45,8 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'biashara-secret-change-me';
 const REFERRAL_BONUS = 50;
 
-const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
-const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY || '';
+// Replaced OneSignal with PushAlert
+const PUSHALERT_API_KEY = process.env.PUSHALERT_API_KEY || '';
 
 function normalizePhone(input) {
   let p = String(input || '').replace(/[^\d+]/g, '');
@@ -83,23 +83,22 @@ async function sendSMS(phone, message) {
   }
 }
 
+// Replaced OneSignal Push with PushAlert API
 async function sendPush(phone, title, message) {
-  if (!ONESIGNAL_APP_ID || !ONESIGNAL_REST_KEY) return;
+  if (!PUSHALERT_API_KEY) return;
   try {
-    const norm = normalizePhone(phone);
-    const res = await fetch('https://onesignal.com/api/v1/notifications', {
+    const payload = new URLSearchParams();
+    payload.append('title', title);
+    payload.append('message', message);
+    payload.append('target_url', 'https://biasharaloans.co.ke');
+
+    const res = await fetch('https://api.pushalert.co/v2/send', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + ONESIGNAL_REST_KEY
+        'Authorization': `api_key=${PUSHALERT_API_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: JSON.stringify({
-        app_id: ONESIGNAL_APP_ID,
-        include_aliases: { external_id: [norm] },
-        target_channel: 'push',
-        headings: { en: title },
-        contents: { en: message }
-      })
+      body: payload
     });
     return await res.json();
   } catch(e) {
@@ -126,9 +125,7 @@ async function notify(phone, title, message, userId) {
       console.error('Failed to save notification:', e.message);
     }
   }
-}
-
-async function uploadToCloudinary(base64Data) {
+}async function uploadToCloudinary(base64Data) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     throw new Error('Cloudinary not configured');
   }
@@ -578,6 +575,7 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
     res.json({ balance: user.balance });
   } catch (e) { res.status(500).json({ error: 'Deposit failed' }); }
 });
+
 app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -594,6 +592,7 @@ app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
+
 app.post('/api/wallet/activation-sms', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
@@ -610,6 +609,7 @@ app.post('/api/wallet/activation-sms', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
+
 app.post('/api/wallet/withdraw', auth, async (req, res) => {
   try {
     const amt = Number(req.body.amount);
@@ -975,7 +975,9 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Loan approval failed' }); }
-});app.get('/api/public/activity', async (req, res) => {
+});
+
+app.get('/api/public/activity', async (req, res) => {
   try {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
     const recent = await txs.aggregate([
