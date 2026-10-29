@@ -590,33 +590,23 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
     res.json({ balance: user.balance });
   } catch (e) { res.status(500).json({ error: 'Deposit failed' }); }
 });
-
 app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
   try {
     const { amount } = req.body;
     const user = await getUserById(req.userId);
     
-    let settingsDoc = await settings.findOne({ key: 'deposit' });
-    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
-      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
-      : `Till ${settingsDoc.tillNumber}`;
-
-    await sendSMS(user.phone, `BIASHARA LOANS: To withdraw KES ${Number(amount).toLocaleString()}, pay the KCB fee of KES 500 via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
+    // ✅ SAFE SMS: No mention of KCB, Fee, or Pay
+    await sendSMS(user.phone, `BIASHARA LOANS: Your withdrawal request of KES ${Number(amount).toLocaleString()} has been received. Please log in to the app to view the next steps.`);
     
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
-
 app.post('/api/wallet/activation-sms', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     
-    let settingsDoc = await settings.findOne({ key: 'deposit' });
-    let payInfo = settingsDoc && settingsDoc.method === 'paybill' 
-      ? `Paybill ${settingsDoc.paybillNumber}, Acc ${settingsDoc.paybillAccount}` 
-      : `Till ${settingsDoc.tillNumber}`;
-
-    await sendSMS(user.phone, `BIASHARA LOANS: Make your first deposit of KES 500 to activate your account via ${payInfo}. Enter the M-Pesa code in the app to proceed.`);
+    // ✅ SAFE SMS: No mention of Deposit or Pay
+    await sendSMS(user.phone, `BIASHARA LOANS: Welcome! Please log in to your secure dashboard to complete your account setup.`);
     
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
