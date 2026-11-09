@@ -56,33 +56,48 @@ function normalizePhone(input) {
   return p;
 }
 
-// ===== CONNECT MEDIA SMS =====
+// ===== SOZURI SMS =====
 async function sendSMS(phone, message) {
-  const apiKey = process.env.CONNECTMEDIA_API_KEY;
-  if (!apiKey) return false;
+  const apiKey = process.env.SOZURI_API_KEY;
+  if (!apiKey) {
+    console.log('⚠️ SMS skipped: SOZURI_API_KEY not configured');
+    return false;
+  }
+
   try {
     const recipient = normalizePhone(phone);
-    const res = await fetch('https://app.connectmedia.co.ke/api.php', {
+    
+    const res = await fetch('https://sozuri.net/api/v1/messaging', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       body: JSON.stringify({
-        action: 'send',
-        to: recipient,
+        project: "Biashara SMS", // Your exact project name from Sozuri
+        apiKey: apiKey,
+        from: "Sozuri", // Default shared sender ID
+        to: recipient, 
         message: message,
-        sender: 'ConectMedia'
-      }),
+        channel: "sms",
+        type: "transactional"
+      })
     });
+
     const body = await res.json();
-    if (body.code !== '201') return false;
-    return true;
+    
+    if (res.ok && body.success !== false) {
+      console.log('✅ Sozuri SMS Sent to', recipient);
+      return true;
+    } else {
+      console.error('❌ Sozuri API Error:', body);
+      return false;
+    }
   } catch (error) {
+    console.error('❌ SMS Network Error:', error.message);
     return false;
   }
 }
-
 // PUSHALERT API INTEGRATION
 async function sendPush(phone, title, message) {
   if (!PUSHALERT_API_KEY) {
