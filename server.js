@@ -1286,6 +1286,13 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to load installs' });
   }
 });
+// --- TEMPORARY SMS TEST ROUTE ---
+app.get('/api/test-sms', async (req, res) => {
+    console.log('--- 🧪 TESTING SMS NOW ---');
+    const testPhone = '254712345678'; // <--- PUT YOUR ACTUAL PHONE NUMBER HERE
+    const result = await sendSMS(testPhone, 'Hello! This is a test from Render to Sozuri.');
+    res.json({ message: 'Test triggered. Check Render logs.', result });
+});
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
