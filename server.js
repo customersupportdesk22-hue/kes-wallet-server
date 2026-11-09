@@ -60,8 +60,9 @@ function normalizePhone(input) {
 async function sendSMS(phone, message) {
   const username = process.env.SMSGATE_USERNAME;
   const password = process.env.SMSGATE_PASSWORD;
+  const deviceId = process.env.SMSGATE_DEVICE_ID; // <-- Added
 
-  if (!username || !password) {
+  if (!username || !password || !deviceId) {
     console.log('⚠️ SMS skipped: SMSGATE credentials missing');
     return false;
   }
@@ -74,7 +75,8 @@ async function sendSMS(phone, message) {
     
     const authToken = Buffer.from(`${username}:${password}`).toString('base64');
     
-    const res = await fetch('https://api.sms-gate.app/3rdparty/v1/messages', {
+    // The URL now includes the Device ID
+    const res = await fetch(`https://api.sms-gate.app/3rdparty/v1/devices/${deviceId}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
