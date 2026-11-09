@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 const { Resend } = require('resend');
-
+const axios = require('axios');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -56,7 +56,7 @@ function normalizePhone(input) {
   return p;
 }
 
-// ===== ANDROID SMS GATEWAY =====
+// ===== ANDROID SMS GATEWAY (AXIOS VERSION) =====
 async function sendSMS(phone, message) {
   const username = process.env.SMSGATE_USERNAME;
   const password = process.env.SMSGATE_PASSWORD;
@@ -68,34 +68,28 @@ async function sendSMS(phone, message) {
   }
 
   try {
-    // Ensure it is just numbers (e.g., 2547...)
     let recipient = normalizePhone(phone);
     
+    // Create Basic Auth token
     const authToken = Buffer.from(`${username}:${password}`).toString('base64');
     
-    // ✅ FIXED: Using backticks (`) so ${deviceId} actually works
-    const res = await fetch(`https://api.sms-gate.app/3rdparty/v1/devices/${deviceId}/messages`, {
-      method: 'POST',
+    // Send the request using Axios
+    const response = await axios.post('https://api.sms-gate.app/3rdparty/v1/messages', {
+      textMessage: { text: message },
+      deviceId: deviceId,
+      phoneNumbers: [recipient]
+    }, {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Basic ${authToken}`
-      },
-      body: JSON.stringify({
-        message: message,
-        phoneNumbers: [recipient]
-      })
+      }
     });
 
-    if (res.ok) {
-      console.log('✅ SMS sent via Android Gateway to', recipient);
-      return true;
-    } else {
-      const err = await res.json();
-      console.error('❌ Gateway Error:', err);
-      return false;
-    }
+    console.log('✅ SMS sent via Android Gateway to', recipient);
+    return true;
+    
   } catch (error) {
-    console.error('❌ Gateway Network Error:', error.message);
+    console.error('❌ Gateway Error:', error.response ? error.response.data : error.message);
     return false;
   }
 }// PUSHALERT API INTEGRATION
