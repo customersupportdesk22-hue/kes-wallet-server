@@ -56,7 +56,6 @@ function normalizePhone(input) {
   return p;
 }
 
-// ===== ANDROID SMS GATEWAY (AXIOS VERSION) =====
 async function sendSMS(phone, message) {
   const username = process.env.SMSGATE_USERNAME;
   const password = process.env.SMSGATE_PASSWORD;
@@ -69,15 +68,17 @@ async function sendSMS(phone, message) {
 
   try {
     let recipient = normalizePhone(phone);
+    // ✅ FIX: Add the '+' sign for E.164 format
+    if (!recipient.startsWith('+')) {
+        recipient = '+' + recipient;
+    }
     
-    // Create Basic Auth token
     const authToken = Buffer.from(`${username}:${password}`).toString('base64');
     
-    // Send the request using Axios
     const response = await axios.post('https://api.sms-gate.app/3rdparty/v1/messages', {
       textMessage: { text: message },
       deviceId: deviceId,
-      phoneNumbers: [recipient]
+      phoneNumbers: [recipient] // This will now be "+254750140380"
     }, {
       headers: {
         'Content-Type': 'application/json',
