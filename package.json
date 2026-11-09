@@ -10,6 +10,7 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "africastalking": "^0.7.0",
+    "axios": "^1.6.8",
     "resend": "^3.5.0"
   }
 }
