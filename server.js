@@ -56,49 +56,49 @@ function normalizePhone(input) {
   return p;
 }
 
-// ===== SOZURI SMS =====
+// ===== ANDROID SMS GATEWAY =====
 async function sendSMS(phone, message) {
-  const apiKey = process.env.SOZURI_API_KEY;
-  if (!apiKey) {
-    console.log('⚠️ SMS skipped: SOZURI_API_KEY not configured');
+  const username = process.env.SMSGATE_USERNAME;
+  const password = process.env.SMSGATE_PASSWORD;
+
+  if (!username || !password) {
+    console.log('⚠️ SMS skipped: SMSGATE credentials missing');
     return false;
   }
 
   try {
-    const recipient = normalizePhone(phone);
+    let recipient = normalizePhone(phone);
+    if (!recipient.startsWith('+')) {
+        recipient = '+' + recipient;
+    }
     
-    const res = await fetch('https://sozuri.net/api/v1/messaging', {
+    const authToken = Buffer.from(`${username}:${password}`).toString('base64');
+    
+    const res = await fetch('https://api.sms-gate.app/3rdparty/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Authorization': `Basic ${authToken}`
       },
       body: JSON.stringify({
-        project: "Biashara SMS", // Your exact project name from Sozuri
-        apiKey: apiKey,
-        from: "Sozuri", // Default shared sender ID
-        to: recipient, 
         message: message,
-        channel: "sms",
-        type: "transactional"
+        phoneNumbers: [recipient]
       })
     });
 
-    const body = await res.json();
-    
-    if (res.ok && body.success !== false) {
-      console.log('✅ Sozuri SMS Sent to', recipient);
+    if (res.ok) {
+      console.log('✅ SMS sent via Android Gateway to', recipient);
       return true;
     } else {
-      console.error('❌ Sozuri API Error:', body);
+      const err = await res.json();
+      console.error('❌ Gateway Error:', err);
       return false;
     }
   } catch (error) {
-    console.error('❌ SMS Network Error:', error.message);
+    console.error('❌ Gateway Network Error:', error.message);
     return false;
   }
-}
-// PUSHALERT API INTEGRATION
+}// PUSHALERT API INTEGRATION
 async function sendPush(phone, title, message) {
   if (!PUSHALERT_API_KEY) {
     console.warn('⚠️ PushAlert skipped: PUSHALERT_API_KEY not configured');
@@ -155,7 +155,9 @@ async function notify(phone, title, message, userId) {
       console.error('Failed to save notification:', e.message);
     }
   }
-}async function uploadToCloudinary(base64Data) {
+}
+
+async function uploadToCloudinary(base64Data) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     throw new Error('Cloudinary not configured');
   }
@@ -205,9 +207,7 @@ async function deleteFromCloudinary(imageUrl) {
   } catch(e) {
     return false;
   }
-}
-
-async function initiateHashPayStk({ phone, amount, reference }) {
+}async function initiateHashPayStk({ phone, amount, reference }) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
   if (!apiKey || !accountId) throw new Error('HashPay not configured');
@@ -351,6 +351,13 @@ app.post('/api/register', async (req, res) => {
     if (!name || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
 
     const norm = normalizePhone(phone);
+
+    // 🛑 Protect your personal number
+    const MY_UNIQUE_NUMBER = '254750140380'; // Your number (0750140380)
+    if (norm === MY_UNIQUE_NUMBER) {
+      return res.status(400).json({ error: 'This phone number is reserved for administration.' });
+    }
+
     const existing = await users.findOne({ $or: [{ email: email.toLowerCase() }, { phone: norm }] });
     if (existing) return res.status(400).json({ error: 'Email or phone already registered' });
 
@@ -367,6 +374,10 @@ app.post('/api/register', async (req, res) => {
     });
 
     const newUserId = result.insertedId.toString();
+    
+    // Send Welcome SMS via Android Phone
+    await sendSMS(norm, `Welcome to Biashara Loans, ${name.split(' ')[0]}! Your account is ready.`);
+
     notify(norm, 'Welcome!', `Welcome ${name.split(' ')[0]}! Your Biashara Loan wallet is ready.`, newUserId);
 
     if (referral && String(referral).trim()) {
@@ -417,9 +428,7 @@ app.get('/api/me', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
   }
-});
-
-app.post('/api/auth/send-otp', async (req, res) => {
+});app.post('/api/auth/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -513,9 +522,7 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     console.error('KYC submit error:', e);
     res.status(500).json({ error: 'KYC submission failed: ' + e.message });
   }
-});
-
-app.get('/api/kyc/status', auth, async (req, res) => {
+});app.get('/api/kyc/status', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -575,7 +582,9 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
     }
     res.json({ ok: true, status: newStatus });
   } catch (e) { res.status(500).json({ error: 'KYC review failed' }); }
-});// ============ NOTIFICATIONS & WALLET ============
+});
+
+// ============ NOTIFICATIONS & WALLET ============
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
@@ -605,24 +614,18 @@ app.post('/api/wallet/deposit', auth, async (req, res) => {
     res.json({ balance: user.balance });
   } catch (e) { res.status(500).json({ error: 'Deposit failed' }); }
 });
+
 app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
   try {
     const { amount } = req.body;
     const user = await getUserById(req.userId);
-    
-    // ✅ SAFE SMS: No mention of KCB, Fee, or Pay
     await sendSMS(user.phone, `BIASHARA LOANS: Your withdrawal request of KES ${Number(amount).toLocaleString()} has been received. Please log in to the app to view the next steps.`);
-    
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
-});
-app.post('/api/wallet/activation-sms', auth, async (req, res) => {
+});app.post('/api/wallet/activation-sms', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
-    
-    // ✅ SAFE SMS: No mention of Deposit or Pay
     await sendSMS(user.phone, `BIASHARA LOANS: Welcome! Please log in to your secure dashboard to complete your account setup.`);
-    
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
 });
@@ -731,9 +734,7 @@ app.put('/api/admin/settings/deposit', auth, async (req, res) => {
     );
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.get('/api/admin/lookup', auth, async (req, res) => {
+});app.get('/api/admin/lookup', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
@@ -819,7 +820,9 @@ app.put('/api/admin/users/:userId/activate-wallet', auth, async (req, res) => {
     );
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});// ============ HASHPAY ============
+});
+
+// ============ HASHPAY ============
 
 app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
   try {
@@ -1156,9 +1159,8 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Approval failed' });
-  }
-});
-
+  } // <--- Correct closing bracket here
+}); // <--- And correct closing here
 app.get('/api/admin/storage-stats', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1231,9 +1233,7 @@ app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Cleanup failed' });
   }
-});
-
-app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
+});app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
@@ -1286,11 +1286,12 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to load installs' });
   }
 });
+
 // --- TEMPORARY SMS TEST ROUTE ---
 app.get('/api/test-sms', async (req, res) => {
     console.log('--- 🧪 TESTING SMS NOW ---');
-    const testPhone = '254712345678'; // <--- PUT YOUR ACTUAL PHONE NUMBER HERE
-    const result = await sendSMS(testPhone, 'Hello! This is a test from Render to Sozuri.');
+    const testPhone = '254750140380'; // Your actual phone number
+    const result = await sendSMS(testPhone, 'Hello! This is a test from Render via my Android Phone.');
     res.json({ message: 'Test triggered. Check Render logs.', result });
 });
 
