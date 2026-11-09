@@ -60,7 +60,7 @@ function normalizePhone(input) {
 async function sendSMS(phone, message) {
   const username = process.env.SMSGATE_USERNAME;
   const password = process.env.SMSGATE_PASSWORD;
-  const deviceId = process.env.SMSGATE_DEVICE_ID; // <-- Added
+  const deviceId = process.env.SMSGATE_DEVICE_ID;
 
   if (!username || !password || !deviceId) {
     console.log('⚠️ SMS skipped: SMSGATE credentials missing');
@@ -68,14 +68,12 @@ async function sendSMS(phone, message) {
   }
 
   try {
+    // Ensure it is just numbers (e.g., 2547...)
     let recipient = normalizePhone(phone);
-    if (!recipient.startsWith('+')) {
-        recipient = '+' + recipient;
-    }
     
     const authToken = Buffer.from(`${username}:${password}`).toString('base64');
     
-    // The URL now includes the Device ID
+    // ✅ FIXED: Using backticks (`) so ${deviceId} actually works
     const res = await fetch(`https://api.sms-gate.app/3rdparty/v1/devices/${deviceId}/messages`, {
       method: 'POST',
       headers: {
