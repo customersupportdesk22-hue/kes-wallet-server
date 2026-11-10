@@ -178,7 +178,7 @@ async function uploadToCloudinary(base64Data) {
   formData.append('timestamp', timestamp);
   formData.append('folder', folder);
   formData.append('signature', signature);
-  const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
+  const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
   const res = await fetch(url, { method: 'POST', body: formData });
   const data = await res.json();
   if (!data.secure_url) {
@@ -287,7 +287,9 @@ function sanitize(u) {
     selfie: u.selfie || null,
     wallet_activated: u.wallet_activated || false,
     has_pin: !!u.pin_hash,
-    features: u.features || { savings: false, insurance: false, bills: false, airtime: false, scan: false }
+    features: u.features || { savings: false, insurance: false, bills: false, airtime: false, scan: false },
+    unlock_offer_override: typeof u.unlock_offer_override === 'boolean' ? u.unlock_offer_override : null,
+    unlock_full_access_visible: typeof u.unlock_offer_override === 'boolean' ? u.unlock_offer_override : u.unlock_full_access_visible !== false
   };
 }
 
@@ -490,7 +492,7 @@ app.get('/api/me', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: sanitize(user) });
+    const safeUser = sanitize(user); const unlockSetting = await settings.findOne({key:'unlock_full_access'}); safeUser.unlock_full_access_visible = typeof user.unlock_offer_override === 'boolean' ? user.unlock_offer_override : unlockSetting?.enabled !== false; res.json({ user: safeUser });
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
   }
@@ -756,7 +758,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
 app.post('/api/kyc/submit', auth, async (req, res) => {
   try {
-    const { idFrontPhoto, idBackPhoto, selfiePhoto, fullName, idNumber, dob } = req.body;
+    const { idFrontPhoto, idBackPhoto, selfiePhoto, fullName, idNumber, dob, kraPin, kraCertificate } = req.body;
     if (!idFrontPhoto || !idBackPhoto || !selfiePhoto) return res.status(400).json({ error: 'ID Front, ID Back, and Selfie are all required' });
     if (!fullName || !idNumber) return res.status(400).json({ error: 'Full name and ID number are required' });
 
@@ -769,9 +771,18 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     const idFrontUrl = await uploadToCloudinary(idFrontPhoto);
     const idBackUrl = await uploadToCloudinary(idBackPhoto);
     const selfieUrl = await uploadToCloudinary(selfiePhoto);
+    const cleanKraPin = String(kraPin || '').trim().toUpperCase();
+    if (cleanKraPin && !/^[A-Z]{1,2}[0-9]{7,9}[A-Z]$/.test(cleanKraPin)) return res.status(400).json({ error: 'Please enter a valid KRA PIN format.' });
+    let kraCertificateUrl = null;
+    if (kraCertificate && kraCertificate.data) {
+      if (String(kraCertificate.data).length > 7 * 1024 * 1024) return res.status(400).json({ error: 'KRA certificate is too large.' });
+      kraCertificateUrl = await uploadToCloudinary(kraCertificate.data);
+    }
 
     const submission = {
       user_id: req.userId, full_name: fullName, id_number: idNumber, dob: dob || null,
+      kra_pin: cleanKraPin || null, kra_status: null, kra_certificate_url: kraCertificateUrl,
+      kra_certificate_name: kraCertificate?.fileName || null,
       id_front_url: idFrontUrl, id_back_url: idBackUrl, selfie_photo_url: selfieUrl,
       status: 'pending', submitted_at: new Date(), reviewed_at: null, reviewed_by: null, rejection_reason: null,
     };
@@ -824,7 +835,7 @@ app.get('/api/admin/pending-kyc', auth, async (req, res) => {
 
     const items = pending.map(k => ({
       id: k._id.toString(), user_id: k.user_id, full_name: k.full_name, id_number: k.id_number, dob: k.dob,
-      id_front_url: k.id_front_url, id_back_url: k.id_back_url, selfie_photo_url: k.selfie_photo_url, submitted_at: k.submitted_at,
+      id_front_url: k.id_front_url, id_back_url: k.id_back_url, selfie_photo_url: k.selfie_photo_url, kra_pin: k.kra_pin || null, kra_status: k.kra_status || null, kra_certificate_url: k.kra_certificate_url || null, kra_certificate_name: k.kra_certificate_name || null, submitted_at: k.submitted_at,
       user: k.user ? { name: k.user.name, phone: k.user.phone, email: k.user.email } : { name: 'Unknown', phone: 'Unknown', email: 'Unknown' }
     }));
     res.json({ items });
@@ -1086,6 +1097,17 @@ app.delete('/api/notifications/clear', auth, async (req, res) => {
   }
 });
 
+// Delete one notification belonging to the signed-in customer.
+app.delete('/api/notifications/:id', auth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Invalid notification ID' });
+    const result = await notifications.deleteOne({ _id: new ObjectId(req.params.id), user_id: req.userId });
+    if (!result.deletedCount) return res.status(404).json({ error: 'Notification not found' });
+    const unreadCount = await notifications.countDocuments({ user_id: req.userId, read: { $ne: true } });
+    res.json({ ok: true, unreadCount });
+  } catch (e) { console.error('Delete notification failed:', e); res.status(500).json({ error: 'Failed to delete notification' }); }
+});
+
 app.get('/api/wallet/txs', auth, async (req, res) => {
   try {
     const list = await txs.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(100).toArray();
@@ -1230,6 +1252,19 @@ app.put('/api/admin/settings/deposit', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
 });
 
+app.get('/api/admin/settings/unlock-offer', auth, async (req, res) => {
+  try { const admin=await getUserById(req.userId); if(!admin||admin.role!=='admin')return res.status(403).json({error:'Admins only'}); const doc=await settings.findOne({key:'unlock_full_access'}); res.json({enabled:doc?.enabled!==false}); }
+  catch(e){res.status(500).json({error:'Failed to load setting'});}
+});
+app.put('/api/admin/settings/unlock-offer', auth, async (req, res) => {
+  try { const admin=await getUserById(req.userId); if(!admin||admin.role!=='admin')return res.status(403).json({error:'Admins only'}); const enabled=req.body.enabled===true; await settings.updateOne({key:'unlock_full_access'},{$set:{enabled,updated_at:new Date(),updated_by:admin._id.toString()}},{upsert:true}); res.json({ok:true,enabled}); }
+  catch(e){res.status(500).json({error:'Failed to save setting'});}
+});
+app.put('/api/admin/users/:userId/unlock-offer', auth, async (req, res) => {
+  try { const admin=await getUserById(req.userId); if(!admin||admin.role!=='admin')return res.status(403).json({error:'Admins only'}); const id=req.params.userId; if(!ObjectId.isValid(id))return res.status(400).json({error:'Invalid customer ID'}); const value=req.body.override; if(!['inherit','on','off'].includes(value))return res.status(400).json({error:'Invalid override'}); const update=value==='inherit'?{$unset:{unlock_offer_override:1}}:{$set:{unlock_offer_override:value==='on'}}; const result=await users.updateOne({_id:new ObjectId(id),role:{$ne:'admin'}},update); if(!result.matchedCount)return res.status(404).json({error:'Customer not found'}); res.json({ok:true,override:value}); }
+  catch(e){res.status(500).json({error:'Failed to update customer setting'});}
+});
+
 app.get('/api/admin/lookup', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1249,7 +1284,7 @@ app.get('/api/admin/lookup', auth, async (req, res) => {
     });
 
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: sanitize(user) });
+    const safeUser = sanitize(user); const unlockSetting = await settings.findOne({key:'unlock_full_access'}); safeUser.unlock_full_access_visible = typeof user.unlock_offer_override === 'boolean' ? user.unlock_offer_override : unlockSetting?.enabled !== false; res.json({ user: safeUser });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
 });
 
