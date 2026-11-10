@@ -1,0 +1,25 @@
+{
+  "name": "Biashara Boost Loans",
+  "short_name": "Biashara",
+  "description": "Fast loans for your business. Apply in 60 seconds.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a1120",
+  "theme_color": "#22c55e",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "https://i.ibb.co/4wc4h3m9/FB-IMG-1790675172784.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://i.ibb.co/4wc4h3m9/FB-IMG-1790675172784.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    }
+  ]
+}
