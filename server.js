@@ -48,6 +48,16 @@ const REFERRAL_BONUS = 50;
 // PUSHALERT SETUP
 const PUSHALERT_API_KEY = process.env.PUSHALERT_API_KEY || '';
 
+// The 47 counties of Kenya (must match the registration dropdown in index.html)
+const COUNTIES = [
+  'Baringo', 'Bomet', 'Bungoma', 'Busia', 'Elgeyo-Marakwet', 'Embu', 'Garissa', 'Homa Bay',
+  'Isiolo', 'Kajiado', 'Kakamega', 'Kericho', 'Kiambu', 'Kilifi', 'Kirinyaga', 'Kisii',
+  'Kisumu', 'Kitui', 'Kwale', 'Laikipia', 'Lamu', 'Machakos', 'Makueni', 'Mandera',
+  'Marsabit', 'Meru', 'Migori', 'Mombasa', "Murang'a", 'Nairobi', 'Nakuru', 'Nandi',
+  'Narok', 'Nyamira', 'Nyandarua', 'Nyeri', 'Samburu', 'Siaya', 'Taita-Taveta', 'Tana River',
+  'Tharaka-Nithi', 'Trans Nzoia', 'Turkana', 'Uasin Gishu', 'Vihiga', 'Wajir', 'West Pokot'
+];
+
 function normalizePhone(input) {
   let p = String(input || '').replace(/[^\d+]/g, '');
   if (p.startsWith('+')) p = p.slice(1);
@@ -72,9 +82,9 @@ async function sendSMS(phone, message) {
     if (!recipient.startsWith('+')) {
         recipient = '+' + recipient;
     }
-    
+
     const authToken = Buffer.from(`${username}:${password}`).toString('base64');
-    
+
     const response = await axios.post('https://api.sms-gate.app/3rdparty/v1/messages', {
       textMessage: { text: message },
       deviceId: deviceId,
@@ -88,12 +98,14 @@ async function sendSMS(phone, message) {
 
     console.log('✅ SMS sent via Android Gateway to', recipient);
     return true;
-    
+
   } catch (error) {
     console.error('❌ Gateway Error:', error.response ? error.response.data : error.message);
     return false;
   }
-}// PUSHALERT API INTEGRATION
+}
+
+// PUSHALERT API INTEGRATION
 async function sendPush(phone, title, message) {
   if (!PUSHALERT_API_KEY) {
     console.warn('⚠️ PushAlert skipped: PUSHALERT_API_KEY not configured');
@@ -113,7 +125,7 @@ async function sendPush(phone, title, message) {
       },
       body: payload.toString()
     });
-    
+
     const text = await res.text();
     try {
       const data = JSON.parse(text);
@@ -136,7 +148,7 @@ async function notify(phone, title, message, userId) {
   await Promise.allSettled([
     sendPush(phone, title, message)
   ]);
-  
+
   if (userId && notifications) {
     try {
       await notifications.insertOne({
@@ -202,7 +214,9 @@ async function deleteFromCloudinary(imageUrl) {
   } catch(e) {
     return false;
   }
-}async function initiateHashPayStk({ phone, amount, reference }) {
+}
+
+async function initiateHashPayStk({ phone, amount, reference }) {
   const apiKey = process.env.HASHPAY_API_KEY;
   const accountId = process.env.HASHPAY_ACCOUNT_ID;
   if (!apiKey || !accountId) throw new Error('HashPay not configured');
@@ -242,11 +256,12 @@ async function connectDB() {
   notifications = db.collection('notifications');
   kyc = db.collection('kyc');
   settings = db.collection('settings');
-  
+
   await users.createIndex({ email: 1 }, { unique: true });
   await users.createIndex({ phone: 1 }, { unique: true });
   await users.createIndex({ referral_code: 1 });
   await notifications.createIndex({ user_id: 1, created_at: -1 });
+  await notifications.createIndex({ user_id: 1, read: 1 });
   await kyc.createIndex({ user_id: 1 });
   await kyc.createIndex({ status: 1, created_at: -1 });
   console.log('MongoDB connected');
@@ -259,6 +274,7 @@ function sanitize(u) {
     name: u.name,
     email: u.email,
     phone: u.phone,
+    county: u.county || null,
     balance: u.balance || 0,
     savings_balance: u.savings_balance || 0,
     role: u.role || 'user',
@@ -270,6 +286,7 @@ function sanitize(u) {
     is_email_verified: u.is_email_verified || false,
     selfie: u.selfie || null,
     wallet_activated: u.wallet_activated || false,
+    has_pin: !!u.pin_hash,
     features: u.features || { savings: false, insurance: false, bills: false, airtime: false, scan: false }
   };
 }
@@ -338,12 +355,66 @@ function buildSchedule(loan) {
     schedule.push({ month: i, due_date: dueDate, amount: loan.monthly, status: 'pending' });
   }
   return schedule;
-}// ============ AUTH & OTP ============
+}
+
+// ============ PIN HELPERS ============
+// The 4-digit PIN is never stored in plain text. It is first run through
+// HMAC-SHA256 with a server-side secret (so a leaked database alone cannot be
+// brute-forced offline) and the result is then hashed with bcrypt.
+// Set PIN_PEPPER in Render's environment variables and never change it
+// afterwards, or every stored PIN stops matching. (Falls back to JWT_SECRET.)
+
+const PIN_RE = /^\d{4}$/;
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_LOCK_MINUTES = 15;
+const PIN_OTP_MINUTES = 10;
+const PIN_OTP_MAX_ATTEMPTS = 5;
+const PIN_OTP_RESEND_SECONDS = 60;
+const PIN_RESET_WINDOW_MINUTES = 10;
+const PIN_PEPPER = process.env.PIN_PEPPER || JWT_SECRET;
+
+function pinDigest(userId, pin) {
+  return crypto.createHmac('sha256', PIN_PEPPER).update('pin:' + String(userId) + ':' + String(pin)).digest('hex');
+}
+
+function otpDigest(userId, otp) {
+  return crypto.createHmac('sha256', PIN_PEPPER).update('otp:' + String(userId) + ':' + String(otp)).digest('hex');
+}
+
+async function hashPin(userId, pin) {
+  return bcrypt.hash(pinDigest(userId, pin), 10);
+}
+
+async function checkPin(userId, pin, hash) {
+  return bcrypt.compare(pinDigest(userId, pin), hash);
+}
+
+function safeEqualHex(a, b) {
+  const x = Buffer.from(String(a || ''), 'utf8');
+  const y = Buffer.from(String(b || ''), 'utf8');
+  if (x.length !== y.length) return false;
+  return crypto.timingSafeEqual(x, y);
+}
+
+function maskPhone(p) {
+  const s = String(p || '');
+  const local = s.startsWith('254') ? '0' + s.slice(3) : s;
+  if (local.length < 8) return '***';
+  return local.slice(0, 4) + '***' + local.slice(-3);
+}
+
+// ============ AUTH & OTP ============
 
 app.post('/api/register', async (req, res) => {
   try {
-    const { name, email, phone, password, idNumber, referral } = req.body;
+    const { name, email, phone, password, idNumber, referral, county } = req.body;
     if (!name || !email || !phone || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) return res.status(400).json({ error: 'Invalid email format.' });
+
+    const countyClean = String(county || '').trim();
+    if (!COUNTIES.includes(countyClean)) return res.status(400).json({ error: 'Please select a valid county.' });
 
     const norm = normalizePhone(phone);
 
@@ -359,7 +430,7 @@ app.post('/api/register', async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const userCode = generateReferralCode(name);
     const result = await users.insertOne({
-      name, email: email.toLowerCase(), phone: norm, password_hash: hash,
+      name, email: email.toLowerCase(), phone: norm, county: countyClean, password_hash: hash,
       balance: 0, savings_balance: 0, role: 'user', status: 'active', id_number: idNumber || null,
       referral_code: userCode, referred_by: null, kyc_status: 'unverified',
       pwa_installed: false, is_email_verified: true,
@@ -369,7 +440,7 @@ app.post('/api/register', async (req, res) => {
     });
 
     const newUserId = result.insertedId.toString();
-    
+
     // Send Welcome SMS via Android Phone
     await sendSMS(norm, `Welcome to Biashara Loans, ${name.split(' ')[0]}! Your account is ready.`);
 
@@ -423,7 +494,212 @@ app.get('/api/me', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Failed' });
   }
-});app.post('/api/auth/send-otp', async (req, res) => {
+});
+
+// ============ PIN (APP LOCK) ============
+
+// Create the PIN for the first time (only allowed while no PIN exists).
+app.post('/api/pin/set', auth, async (req, res) => {
+  try {
+    const pin = String(req.body.pin || '');
+    if (!PIN_RE.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits.' });
+
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.pin_hash) return res.status(409).json({ error: 'A PIN is already set. Enter your PIN to continue.' });
+
+    const pinHash = await hashPin(req.userId, pin);
+    const result = await users.updateOne(
+      { _id: user._id, pin_hash: { $exists: false } },
+      { $set: { pin_hash: pinHash, pin_set_at: new Date(), pin_failed_attempts: 0 }, $unset: { pin_locked_until: '' } }
+    );
+    if (!result.matchedCount) return res.status(409).json({ error: 'A PIN is already set. Enter your PIN to continue.' });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PIN set error:', e);
+    res.status(500).json({ error: 'Could not save your PIN. Please try again.' });
+  }
+});
+
+// Check the PIN (with attempt limit and temporary lockout).
+app.post('/api/pin/verify', auth, async (req, res) => {
+  try {
+    const pin = String(req.body.pin || '');
+    if (!PIN_RE.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits.' });
+
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.pin_hash) return res.status(409).json({ error: 'No PIN has been set yet.' });
+
+    if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) {
+      const mins = Math.ceil((new Date(user.pin_locked_until).getTime() - Date.now()) / 60000);
+      return res.status(429).json({ error: `Too many wrong attempts. Try again in ${mins} minute${mins === 1 ? '' : 's'}, or tap Forgot Your PIN.` });
+    }
+
+    const ok = await checkPin(req.userId, pin, user.pin_hash);
+    if (!ok) {
+      const attempts = (user.pin_failed_attempts || 0) + 1;
+      if (attempts >= PIN_MAX_ATTEMPTS) {
+        await users.updateOne(
+          { _id: user._id },
+          { $set: { pin_failed_attempts: 0, pin_locked_until: new Date(Date.now() + PIN_LOCK_MINUTES * 60000) } }
+        );
+        return res.status(429).json({ error: `Too many wrong attempts. PIN locked for ${PIN_LOCK_MINUTES} minutes. You can also tap Forgot Your PIN.` });
+      }
+      await users.updateOne({ _id: user._id }, { $set: { pin_failed_attempts: attempts } });
+      const left = PIN_MAX_ATTEMPTS - attempts;
+      return res.status(401).json({ error: `Incorrect PIN. ${left} attempt${left === 1 ? '' : 's'} left.` });
+    }
+
+    if (user.pin_failed_attempts || user.pin_locked_until) {
+      await users.updateOne({ _id: user._id }, { $set: { pin_failed_attempts: 0 }, $unset: { pin_locked_until: '' } });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PIN verify error:', e);
+    res.status(500).json({ error: 'Could not check your PIN. Please try again.' });
+  }
+});
+
+// Forgot PIN, step 1: send a 6-digit code to the registered phone by SMS
+// (falls back to email if the SMS gateway is unavailable).
+app.post('/api/pin/forgot', auth, async (req, res) => {
+  try {
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.pin_hash) return res.status(400).json({ error: 'You have not set a PIN yet.' });
+
+    const now = Date.now();
+    if (user.pin_reset_sent_at) {
+      const elapsed = now - new Date(user.pin_reset_sent_at).getTime();
+      if (elapsed < PIN_OTP_RESEND_SECONDS * 1000) {
+        const wait = Math.ceil((PIN_OTP_RESEND_SECONDS * 1000 - elapsed) / 1000);
+        return res.status(429).json({ error: `Please wait ${wait} seconds before requesting another code.` });
+      }
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    await users.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          pin_reset_hash: otpDigest(req.userId, otp),
+          pin_reset_expires: new Date(now + PIN_OTP_MINUTES * 60000),
+          pin_reset_attempts: 0,
+          pin_reset_sent_at: new Date(now)
+        },
+        $unset: { pin_reset_verified_until: '' }
+      }
+    );
+
+    let sent = await sendSMS(user.phone, `BIASHARA LOANS: Your PIN reset code is ${otp}. It expires in ${PIN_OTP_MINUTES} minutes. Never share this code with anyone.`);
+    if (!sent && user.email) {
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+          <h2 style="color: #003B5C; text-align: center;">Reset Your PIN</h2>
+          <p>Hello ${String(user.name || '').split(' ')[0]},</p>
+          <p>Use this code to reset your Biashara Loans PIN.</p>
+          <div style="background: #f0f2f5; padding: 15px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; color: #333; margin: 20px 0; border-radius: 8px;">${otp}</div>
+          <p style="color: #666; font-size: 12px;">This code expires in ${PIN_OTP_MINUTES} minutes. If you did not request it, ignore this email and do not share the code.</p>
+        </div>
+      `;
+      sent = await sendEmail(user.email, 'Your PIN Reset Code - Biashara Loans', html);
+    }
+
+    if (!sent) {
+      await users.updateOne(
+        { _id: user._id },
+        { $unset: { pin_reset_hash: '', pin_reset_expires: '', pin_reset_attempts: '', pin_reset_sent_at: '' } }
+      );
+      return res.status(500).json({ error: 'We could not send the code. Please try again shortly.' });
+    }
+
+    res.json({ ok: true, sent_to: maskPhone(user.phone), expires_in_minutes: PIN_OTP_MINUTES });
+  } catch (e) {
+    console.error('PIN forgot error:', e);
+    res.status(500).json({ error: 'Could not start the PIN reset. Please try again.' });
+  }
+});
+
+// Forgot PIN, step 2: check the 6-digit code.
+app.post('/api/pin/forgot/verify', auth, async (req, res) => {
+  try {
+    const otp = String(req.body.otp || '').replace(/\D/g, '');
+    if (otp.length !== 6) return res.status(400).json({ error: 'Enter the 6-digit code.' });
+
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.pin_reset_hash || !user.pin_reset_expires) {
+      return res.status(400).json({ error: 'No reset request found. Please request a new code.' });
+    }
+
+    const clearOtp = { $unset: { pin_reset_hash: '', pin_reset_expires: '', pin_reset_attempts: '' } };
+
+    if (new Date() > new Date(user.pin_reset_expires)) {
+      await users.updateOne({ _id: user._id }, clearOtp);
+      return res.status(400).json({ error: 'This code has expired. Please request a new one.' });
+    }
+    if ((user.pin_reset_attempts || 0) >= PIN_OTP_MAX_ATTEMPTS) {
+      await users.updateOne({ _id: user._id }, clearOtp);
+      return res.status(429).json({ error: 'Too many incorrect codes. Please request a new one.' });
+    }
+
+    if (!safeEqualHex(otpDigest(req.userId, otp), user.pin_reset_hash)) {
+      const attempts = (user.pin_reset_attempts || 0) + 1;
+      if (attempts >= PIN_OTP_MAX_ATTEMPTS) {
+        await users.updateOne({ _id: user._id }, clearOtp);
+        return res.status(429).json({ error: 'Too many incorrect codes. Please request a new one.' });
+      }
+      await users.updateOne({ _id: user._id }, { $set: { pin_reset_attempts: attempts } });
+      return res.status(400).json({ error: 'Incorrect code. Please check and try again.' });
+    }
+
+    await users.updateOne(
+      { _id: user._id },
+      {
+        $set: { pin_reset_verified_until: new Date(Date.now() + PIN_RESET_WINDOW_MINUTES * 60000) },
+        $unset: { pin_reset_hash: '', pin_reset_expires: '', pin_reset_attempts: '' }
+      }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PIN forgot verify error:', e);
+    res.status(500).json({ error: 'Could not verify the code. Please try again.' });
+  }
+});
+
+// Forgot PIN, step 3: save the new PIN (only works right after a verified code).
+app.post('/api/pin/reset', auth, async (req, res) => {
+  try {
+    const pin = String(req.body.pin || '');
+    if (!PIN_RE.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits.' });
+
+    const user = await getUserById(req.userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.pin_reset_verified_until || new Date() > new Date(user.pin_reset_verified_until)) {
+      return res.status(403).json({ error: 'Verification expired. Please request a new code.' });
+    }
+
+    const pinHash = await hashPin(req.userId, pin);
+    const result = await users.updateOne(
+      { _id: user._id, pin_reset_verified_until: { $gt: new Date() } },
+      {
+        $set: { pin_hash: pinHash, pin_set_at: new Date(), pin_failed_attempts: 0 },
+        $unset: { pin_locked_until: '', pin_reset_verified_until: '', pin_reset_sent_at: '', pin_reset_hash: '', pin_reset_expires: '', pin_reset_attempts: '' }
+      }
+    );
+    if (!result.matchedCount) return res.status(403).json({ error: 'Verification expired. Please request a new code.' });
+
+    notify(user.phone, '🔐 PIN Changed', 'Your Biashara Loans PIN was reset. If this was not you, contact support immediately.', req.userId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PIN reset error:', e);
+    res.status(500).json({ error: 'Could not reset your PIN. Please try again.' });
+  }
+});
+
+app.post('/api/auth/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
@@ -449,7 +725,7 @@ app.get('/api/me', auth, async (req, res) => {
     if (!sent) {
       return res.status(500).json({ error: 'Failed to send email' });
     }
-    
+
     res.json({ ok: true, message: 'OTP sent to email' });
   } catch (e) {
     console.error(e);
@@ -467,7 +743,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     if (new Date() > new Date(user.email_otp_expires)) return res.status(400).json({ error: 'Verification code has expired' });
 
     await users.updateOne({ _id: user._id }, { $set: { is_email_verified: true }, $unset: { email_otp: 1, email_otp_expires: 1 } });
-    
+
     const token = jwt.sign({ userId: user._id.toString() }, JWT_SECRET, { expiresIn: '90d' });
     res.json({ ok: true, token, user: sanitize(user), message: 'Email verified successfully' });
   } catch (e) {
@@ -486,7 +762,7 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
 
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    
+
     if (user.kyc_status === 'pending') return res.status(400).json({ error: 'Your KYC is already under review. Please wait for approval.' });
     if (user.kyc_status === 'verified') return res.status(400).json({ error: 'Your KYC is already verified' });
 
@@ -503,12 +779,12 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     await kyc.deleteMany({ user_id: req.userId, status: 'pending' });
     const result = await kyc.insertOne(submission);
 
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { 
-      $set: { 
-        kyc_status: 'pending', 
+    await users.updateOne({ _id: new ObjectId(req.userId) }, {
+      $set: {
+        kyc_status: 'pending',
         kyc_submitted_at: new Date(),
-        selfie: selfieUrl 
-      } 
+        selfie: selfieUrl
+      }
     });
     notify(user.phone, '📋 KYC Received', `Your identity verification has been received. We'll review it within 24 hours.`, req.userId);
 
@@ -517,7 +793,9 @@ app.post('/api/kyc/submit', auth, async (req, res) => {
     console.error('KYC submit error:', e);
     res.status(500).json({ error: 'KYC submission failed: ' + e.message });
   }
-});app.get('/api/kyc/status', auth, async (req, res) => {
+});
+
+app.get('/api/kyc/status', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -581,12 +859,231 @@ app.post('/api/admin/approve-kyc', auth, async (req, res) => {
 
 // ============ NOTIFICATIONS & WALLET ============
 
+// Admin can send a notification to one customer or broadcast to all customers.
+app.post('/api/admin/send-notification', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ error: 'Admins only' });
+    }
+
+    const title = String(req.body.title || '').trim();
+    const message = String(req.body.message || '').trim();
+    const userId = req.body.userId ? String(req.body.userId).trim() : null;
+
+    if (!title || !message) {
+      return res.status(400).json({ error: 'Title and message are required' });
+    }
+    if (title.length > 100 || message.length > 2000) {
+      return res.status(400).json({ error: 'Title or message is too long' });
+    }
+
+    let recipients;
+    if (userId) {
+      if (!ObjectId.isValid(userId)) {
+        return res.status(400).json({ error: 'Invalid customer ID' });
+      }
+      const customer = await users.findOne({ _id: new ObjectId(userId), role: { $ne: 'admin' } });
+      if (!customer) return res.status(404).json({ error: 'Customer not found' });
+      recipients = [customer];
+    } else {
+      recipients = await users.find({ role: { $ne: 'admin' } }, {
+        projection: { _id: 1, phone: 1 }
+      }).toArray();
+    }
+
+    if (!recipients.length) {
+      return res.status(404).json({ error: 'No customers found' });
+    }
+
+    const createdAt = new Date();
+    const docs = recipients.map(customer => ({
+      user_id: customer._id.toString(),
+      title,
+      message,
+      read: false,
+      created_at: createdAt,
+      sent_by: admin._id.toString(),
+      type: 'admin'
+    }));
+
+    await notifications.insertMany(docs);
+    res.json({ ok: true, sent: docs.length, scope: userId ? 'customer' : 'all_customers' });
+  } catch (e) {
+    console.error('Admin send notification failed:', e);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+
+// Admin notification composer endpoint used by admin-approve.html.
+app.post('/api/admin/notifications', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    const target = req.body.target === 'individual' ? 'individual' : 'all';
+    const title = String(req.body.title || '').trim();
+    const message = String(req.body.message || '').trim();
+    const category = String(req.body.type || 'general').slice(0, 40);
+    if (!title || !message) return res.status(400).json({ error: 'Title and message are required' });
+    if (title.length > 100 || message.length > 1500) return res.status(400).json({ error: 'Title or message is too long' });
+    let recipients;
+    if (target === 'individual') {
+      const q = String(req.body.customer || '').trim();
+      if (!q) return res.status(400).json({ error: 'Enter customer phone, email or ID' });
+      const norm = normalizePhone(q);
+      const customer = await users.findOne({ role: { $ne: 'admin' }, $or: [
+        { phone: norm }, { phone: q }, { email: q.toLowerCase() },
+        ...(ObjectId.isValid(q) ? [{ _id: new ObjectId(q) }] : [])
+      ] });
+      if (!customer) return res.status(404).json({ error: 'Customer not found' });
+      recipients = [customer];
+    } else {
+      recipients = await users.find({ role: { $ne: 'admin' } }, { projection: { _id: 1 } }).toArray();
+    }
+    if (!recipients.length) return res.status(404).json({ error: 'No customers found' });
+    const createdAt = new Date();
+    const expiry = req.body.expiresAt ? new Date(req.body.expiresAt) : null;
+    if (expiry && Number.isNaN(expiry.getTime())) return res.status(400).json({ error: 'Invalid expiry date' });
+    const docs = recipients.map(u => ({
+      user_id: u._id.toString(), title, message, read: false, created_at: createdAt,
+      sent_by: admin._id.toString(), type: 'admin', category,
+      expires_at: expiry && expiry > createdAt ? expiry : null,
+      target: target === 'all' ? 'all_customers' : 'individual'
+    }));
+    await notifications.insertMany(docs);
+    res.json({ ok: true, sent: docs.length, target, created_at: createdAt });
+  } catch (e) {
+    console.error('Admin notification error:', e);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
+// Admin-only sent notification history (group broadcast copies into one record).
+app.get('/api/admin/notifications', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    const docs = await notifications.find({ sent_by: req.userId, type: 'admin' }).sort({ created_at: -1 }).limit(500).toArray();
+    const grouped = new Map();
+    for (const n of docs) {
+      const key = [n.title, n.message, new Date(n.created_at).toISOString()].join('|');
+      if (!grouped.has(key)) grouped.set(key, { title:n.title, message:n.message, target:n.target || 'individual', category:n.category || 'general', created_at:n.created_at, recipients:0 });
+      grouped.get(key).recipients++;
+    }
+    res.json({ items: Array.from(grouped.values()).slice(0,100) });
+  } catch (e) {
+    console.error('Admin notification history error:', e);
+    res.status(500).json({ error: 'Failed to load notification history' });
+  }
+});
+
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    const list = await notifications.find({ user_id: req.userId }).sort({ created_at: -1 }).limit(50).toArray();
-    const items = list.map(n => ({ id: n._id.toString(), title: n.title, message: n.message, read: n.read || false, created_at: n.created_at }));
-    res.json({ items, unreadCount: items.filter(n => !n.read).length });
-  } catch (e) { res.status(500).json({ error: 'Failed' }); }
+    const list = await notifications.find({ user_id: req.userId })
+      .sort({ created_at: -1 }).limit(50).toArray();
+
+    const items = list.map(n => ({
+      id: n._id.toString(),
+      title: n.title,
+      message: n.message,
+      read: n.read === true,
+      created_at: n.created_at
+    }));
+
+    const unreadCount = await notifications.countDocuments({
+      user_id: req.userId,
+      read: { $ne: true }
+    });
+
+    res.json({ items, unreadCount });
+  } catch (e) {
+    console.error('Load notifications failed:', e);
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
+});
+
+// Get the customer's current unread notification count.
+app.get('/api/notifications/unread-count', auth, async (req, res) => {
+  try {
+    const unreadCount = await notifications.countDocuments({
+      user_id: req.userId,
+      read: { $ne: true }
+    });
+    res.json({ unreadCount });
+  } catch (e) {
+    console.error('Unread notification count failed:', e);
+    res.status(500).json({ error: 'Failed to load unread count' });
+  }
+});
+
+// Mark one notification as read. Ownership is enforced by user_id.
+app.patch('/api/notifications/:id/read', auth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid notification ID' });
+    }
+
+    const result = await notifications.updateOne(
+      { _id: new ObjectId(req.params.id), user_id: req.userId },
+      { $set: { read: true, read_at: new Date() } }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    const unreadCount = await notifications.countDocuments({
+      user_id: req.userId,
+      read: { $ne: true }
+    });
+
+    res.json({ ok: true, unreadCount });
+  } catch (e) {
+    console.error('Mark notification read failed:', e);
+    res.status(500).json({ error: 'Failed to update notification' });
+  }
+});
+
+// Mark every notification belonging to the signed-in customer as read.
+app.patch('/api/notifications/read-all', auth, async (req, res) => {
+  try {
+    const result = await notifications.updateMany(
+      { user_id: req.userId, read: { $ne: true } },
+      { $set: { read: true, read_at: new Date() } }
+    );
+
+    res.json({ ok: true, updated: result.modifiedCount, unreadCount: 0 });
+  } catch (e) {
+    console.error('Mark all notifications read failed:', e);
+    res.status(500).json({ error: 'Failed to update notifications' });
+  }
+});
+
+
+// Backward-compatible PUT endpoint used by the current customer page.
+app.put('/api/notifications/read-all', auth, async (req, res) => {
+  try {
+    const result = await notifications.updateMany(
+      { user_id: req.userId, read: { $ne: true } },
+      { $set: { read: true, read_at: new Date() } }
+    );
+    res.json({ ok: true, updated: result.modifiedCount, unreadCount: 0 });
+  } catch (e) {
+    console.error('Mark all notifications read failed:', e);
+    res.status(500).json({ error: 'Failed to update notifications' });
+  }
+});
+
+// Customers can clear only their own notification history.
+app.delete('/api/notifications/clear', auth, async (req, res) => {
+  try {
+    const result = await notifications.deleteMany({ user_id: req.userId });
+    res.json({ ok: true, deleted: result.deletedCount || 0 });
+  } catch (e) {
+    console.error('Clear notifications failed:', e);
+    res.status(500).json({ error: 'Failed to clear notifications' });
+  }
 });
 
 app.get('/api/wallet/txs', auth, async (req, res) => {
@@ -617,7 +1114,9 @@ app.post('/api/wallet/withdrawal-sms', auth, async (req, res) => {
     await sendSMS(user.phone, `BIASHARA LOANS: Your withdrawal request of KES ${Number(amount).toLocaleString()} has been received. Please log in to the app to view the next steps.`);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Failed to send SMS' }); }
-});app.post('/api/wallet/activation-sms', auth, async (req, res) => {
+});
+
+app.post('/api/wallet/activation-sms', auth, async (req, res) => {
   try {
     const user = await getUserById(req.userId);
     await sendSMS(user.phone, `BIASHARA LOANS: Welcome! Please log in to your secure dashboard to complete your account setup.`);
@@ -631,11 +1130,11 @@ app.post('/api/wallet/withdraw', auth, async (req, res) => {
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
     const user = await getUserById(req.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    
+
     if (!user.wallet_activated) {
       return res.status(403).json({ error: 'Please activate your wallet by paying the KES 500 KCB fee.' });
     }
-    
+
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
     const existingPending = await txs.findOne({ user_id: req.userId, type: 'withdrawal', status: 'pending' });
@@ -661,15 +1160,15 @@ app.post('/api/wallet/save', auth, async (req, res) => {
     const { amount } = req.body;
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
-    
+
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
     await users.updateOne(
-      { _id: new ObjectId(req.userId) }, 
+      { _id: new ObjectId(req.userId) },
       { $inc: { balance: -amt, savings_balance: amt } }
     );
-    
+
     await txs.insertOne({
       user_id: req.userId, type: 'withdrawal', amount: amt,
       description: `Moved to savings`, reference: makeRef(),
@@ -686,12 +1185,12 @@ app.post('/api/wallet/buy-airtime', auth, async (req, res) => {
     const { phone, amount } = req.body;
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
-    
+
     const user = await getUserById(req.userId);
     if (user.balance < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
     await users.updateOne({ _id: new ObjectId(req.userId) }, { $inc: { balance: -amt } });
-    
+
     await txs.insertOne({
       user_id: req.userId, type: 'withdrawal', amount: amt,
       description: `Airtime purchase for ${phone}`, reference: makeRef(),
@@ -719,9 +1218,9 @@ app.put('/api/admin/settings/deposit', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    
+
     const { method, paybillNumber, paybillAccount, tillNumber, sendMoneyNumber, sendMoneyName } = req.body;
-    
+
     await settings.updateOne(
       { key: 'deposit' },
       { $set: { method, paybillNumber, paybillAccount, tillNumber, sendMoneyNumber, sendMoneyName } },
@@ -729,14 +1228,16 @@ app.put('/api/admin/settings/deposit', auth, async (req, res) => {
     );
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});app.get('/api/admin/lookup', auth, async (req, res) => {
+});
+
+app.get('/api/admin/lookup', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    
+
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Query required' });
-    
+
     const norm = normalizePhone(query);
     const user = await users.findOne({
       $or: [
@@ -746,7 +1247,7 @@ app.put('/api/admin/settings/deposit', auth, async (req, res) => {
         { _id: ObjectId.isValid(query) ? new ObjectId(query) : null }
       ]
     });
-    
+
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ user: sanitize(user) });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
@@ -756,10 +1257,10 @@ app.put('/api/admin/users/:userId/feature', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    
+
     const targetUserId = req.params.userId;
     const { feature, status } = req.body;
-    
+
     await users.updateOne(
       { _id: new ObjectId(targetUserId) },
       { $set: { [`features.${feature}`]: status } }
@@ -772,12 +1273,12 @@ app.post('/api/wallet/request-activation', auth, async (req, res) => {
   try {
     const { mpesaCode } = req.body;
     if (!mpesaCode) return res.status(400).json({ error: 'Code required' });
-    
-    await users.updateOne({ _id: new ObjectId(req.userId) }, { 
-      $set: { 
+
+    await users.updateOne({ _id: new ObjectId(req.userId) }, {
+      $set: {
         wallet_activation_code: mpesaCode,
         wallet_activation_requested_at: new Date()
-      } 
+      }
     });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
@@ -787,16 +1288,16 @@ app.get('/api/admin/pending-activations', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    
-    const pending = await users.find({ 
+
+    const pending = await users.find({
       wallet_activation_code: { $exists: true, $ne: null },
-      wallet_activated: false 
+      wallet_activated: false
     }).sort({ wallet_activation_requested_at: -1 }).toArray();
-    
+
     const items = pending.map(u => ({
       id: u._id.toString(), name: u.name, phone: u.phone, email: u.email, code: u.wallet_activation_code, requested_at: u.wallet_activation_requested_at
     }));
-    
+
     res.json({ items });
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
 });
@@ -805,10 +1306,10 @@ app.put('/api/admin/users/:userId/activate-wallet', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
-    
+
     const targetUserId = req.params.userId;
     const { status } = req.body;
-    
+
     await users.updateOne(
       { _id: new ObjectId(targetUserId) },
       { $set: { wallet_activated: status } }
@@ -843,7 +1344,7 @@ app.post('/api/hashpay/pay-fee', auth, async (req, res) => {
           await users.updateOne({ _id: new ObjectId(tx.user_id) }, { $inc: { balance: tx.amount } });
         }
       } catch (err) {}
-    }, 5 * 60 * 1000); 
+    }, 5 * 60 * 1000);
 
     res.json({ ok: true, message: `We sent an M-Pesa prompt to ${cleanPhone}.`, phone: cleanPhone, fee: fee, hashpay: hpResponse });
   } catch (e) { res.status(500).json({ error: 'Could not send M-Pesa request: ' + e.message }); }
@@ -935,7 +1436,7 @@ app.post('/api/loans/apply', auth, async (req, res) => {
     });
 
     await sendSMS(user.phone, `BIASHARA LOANS: We have received your loan application of KES ${amt.toLocaleString()}. We will notify you once it has been reviewed.`);
-    
+
     notify(user.phone, '📝 Application Received', `Hi ${user.name.split(' ')[0]}, we received your loan application for KES ${amt.toLocaleString()}.`, req.userId);
     res.json({ ok: true, loanId: result.insertedId.toString() });
   } catch (e) { res.status(500).json({ error: 'Loan failed: ' + e.message }); }
@@ -968,9 +1469,9 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
     const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
     if (user) {
       await sendSMS(user.phone, `BIASHARA LOANS: Congratulations! Your loan of KES ${loan.amount.toLocaleString()} is approved. Check your account for details.`);
-      
+
       notify(user.phone, '🎉 Loan Approved!', `Your loan of KES ${loan.amount.toLocaleString()} has been approved.`, loan.user_id);
-      
+
       const emailHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
           <h2 style="color: #22c55e; text-align: center;">🎉 Loan Approved!</h2>
@@ -988,6 +1489,47 @@ app.post('/api/admin/approve-loan', auth, async (req, res) => {
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Loan approval failed' }); }
+});
+
+
+app.post('/api/admin/reject-loan', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    const { loanId, reason } = req.body;
+    if (!ObjectId.isValid(String(loanId || ''))) return res.status(400).json({ error: 'Valid loan ID is required' });
+    const loan = await loans.findOne({ _id: new ObjectId(loanId), status: 'pending' });
+    if (!loan) return res.status(404).json({ error: 'Pending loan not found or already reviewed' });
+    const why = String(reason || 'Your application did not meet the current lending criteria.').trim().slice(0,500);
+    await loans.updateOne({ _id: loan._id, status: 'pending' }, { $set: { status: 'rejected', rejection_reason: why, rejected_at: new Date(), rejected_by: req.userId } });
+    const user = await users.findOne({ _id: new ObjectId(loan.user_id) });
+    if (user) notify(user.phone, 'Loan Application Update', `Your loan application was not approved. Reason: ${why}`, loan.user_id);
+    res.json({ ok: true, status: 'rejected' });
+  } catch (e) {
+    console.error('Reject loan failed:', e);
+    res.status(500).json({ error: 'Loan rejection failed' });
+  }
+});
+
+app.post('/api/admin/reject-withdrawal', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    const { txId, reason } = req.body;
+    if (!ObjectId.isValid(String(txId || ''))) return res.status(400).json({ error: 'Valid transaction ID is required' });
+    const tx = await txs.findOne({ _id: new ObjectId(txId), type: 'withdrawal', status: 'pending' });
+    if (!tx) return res.status(404).json({ error: 'Pending withdrawal not found or already reviewed' });
+    const result = await txs.updateOne({ _id: tx._id, status: 'pending' }, { $set: { status: 'rejected', rejection_reason: String(reason || 'Withdrawal rejected').slice(0,500), rejected_at: new Date(), rejected_by: req.userId } });
+    if (!result.modifiedCount) return res.status(409).json({ error: 'Withdrawal was already reviewed' });
+    // The amount was deducted when the withdrawal was requested; return it exactly once.
+    await users.updateOne({ _id: new ObjectId(tx.user_id) }, { $inc: { balance: Number(tx.amount || 0) } });
+    const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
+    if (user) notify(user.phone, 'Withdrawal Rejected', `Your withdrawal of KES ${Number(tx.amount || 0).toLocaleString()} was rejected and the amount has been returned to your wallet.`, tx.user_id);
+    res.json({ ok: true, status: 'rejected', refunded: Number(tx.amount || 0) });
+  } catch (e) {
+    console.error('Reject withdrawal failed:', e);
+    res.status(500).json({ error: 'Withdrawal rejection failed' });
+  }
 });
 
 app.get('/api/public/activity', async (req, res) => {
@@ -1071,7 +1613,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v19-pushalert-fix' }));
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Biashara backend is running', version: 'v20-pin-security' }));
 
 // ============ MISSING ADMIN ROUTES ============
 
@@ -1146,7 +1688,7 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
     const user = await users.findOne({ _id: new ObjectId(tx.user_id) });
     if (user) {
       await sendSMS(user.phone, `BIASHARA LOANS: KES ${tx.amount.toLocaleString()} has been disbursed to your wallet. Log in to confirm receipt and check repayment details.`);
-      
+
       notify(user.phone, '✅ Withdrawal Complete', `Your withdrawal of KES ${tx.amount.toLocaleString()} has been sent. Receipt: ${finalReceipt}`, tx.user_id);
     }
 
@@ -1154,8 +1696,9 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Approval failed' });
-  } // <--- Correct closing bracket here
-}); // <--- And correct closing here
+  }
+});
+
 app.get('/api/admin/storage-stats', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1166,7 +1709,7 @@ app.get('/api/admin/storage-stats', auth, async (req, res) => {
     const loanCount = await loans.countDocuments({});
     const notifCount = await notifications.countDocuments({});
     const kycCount = await kyc.countDocuments({});
-    const kycWithPhotos = await kyc.countDocuments({ 
+    const kycWithPhotos = await kyc.countDocuments({
       $or: [
         { id_front_url: { $ne: null } },
         { id_back_url: { $ne: null } },
@@ -1228,7 +1771,9 @@ app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Cleanup failed' });
   }
-});app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
+});
+
+app.post('/api/admin/cleanup-notifications', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
     if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
@@ -1240,7 +1785,7 @@ app.post('/api/admin/cleanup-kyc-photos', auth, async (req, res) => {
       created_at: { $lt: cutoff }
     });
 
-      res.json({ ok: true, deleted: result.deletedCount, days: days });
+    res.json({ ok: true, deleted: result.deletedCount, days: days });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Cleanup failed' });
@@ -1282,13 +1827,7 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
   }
 });
 
-// --- TEMPORARY SMS TEST ROUTE ---
-app.get('/api/test-sms', async (req, res) => {
-    console.log('--- 🧪 TESTING SMS NOW ---');
-    const testPhone = '254750140380'; // Your actual phone number
-    const result = await sendSMS(testPhone, 'Hello! This is a test from Render via my Android Phone.');
-    res.json({ message: 'Test triggered. Check Render logs.', result });
-});
+// Temporary hard-coded SMS test route removed for security.
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log('Server running on port ' + PORT));
