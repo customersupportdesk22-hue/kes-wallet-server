@@ -90,10 +90,10 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       '.lc-act .dng{color:#c62828}' +
       '#lc-c{display:flex;gap:8px;overflow-x:auto;padding:10px 10px 6px;background:#fff;flex:none;scrollbar-width:none}#lc-c::-webkit-scrollbar{display:none}' +
       '.lc-ch{flex:none;border:1px solid ' + C.accent + ';background:#e9fbef;color:' + C.header + ';border-radius:20px;padding:8px 14px;font-size:14px;cursor:pointer;white-space:nowrap}' +
-      '#lc-f{display:flex;gap:8px;align-items:center;padding:8px 10px 10px;background:#fff;flex:none}' +
+      '#lc-f{display:flex;gap:8px;align-items:flex-end;padding:8px 10px calc(10px + env(safe-area-inset-bottom,0px));background:#fff;flex:none}' +
       '#lc-p{background:none;border:0;font-size:24px;cursor:pointer;padding:4px 2px;flex:none}' +
-      '#lc-i{flex:1;min-width:0;padding:12px 16px;border:1px solid #d1d7db;border-radius:24px;font-size:16px;outline:none;background:#fff;color:#111}#lc-i:focus{border-color:' + C.accent + '}' +
-      '#lc-go{background:' + C.accent + ';color:#fff;border:0;border-radius:24px;padding:12px 20px;font-weight:700;font-size:16px;cursor:pointer;flex:none}' +
+      '#lc-i{flex:1;min-width:0;padding:11px 16px;border:1px solid #d1d7db;border-radius:22px;font-size:16px;line-height:1.35;outline:none;background:#fff;color:#111;resize:none;overflow-y:auto;max-height:120px;height:44px;display:block;font-family:inherit}#lc-i:focus{border-color:' + C.accent + '}' +
+      '#lc-go{height:44px;background:' + C.accent + ';color:#fff;border:0;border-radius:24px;padding:12px 20px;font-weight:700;font-size:16px;cursor:pointer;flex:none}' +
       '#lc-v{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:100000;display:none;flex-direction:column;align-items:center;justify-content:center;padding:16px}#lc-v.on{display:flex}' +
       '#lc-v img{max-width:100%;max-height:78vh;border-radius:8px}#lc-v .bar{display:flex;gap:12px;margin-top:16px}' +
       '#lc-v button{border:0;border-radius:20px;padding:10px 20px;font-size:15px;font-weight:600;cursor:pointer}' +
@@ -109,7 +109,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
         '<div id="lc-av"></div><div><div id="lc-t"></div><div id="lc-s">Connecting…</div></div></div>' +
         '<div id="lc-m"></div><div id="lc-c"></div>' +
         '<form id="lc-f" autocomplete="off"><button type="button" id="lc-p" aria-label="Send a photo">📎</button><input type="file" id="lc-file" accept="image/*" hidden>' +
-        '<input id="lc-i" placeholder="Type a message…" maxlength="1500" enterkeyhint="send"><button id="lc-go" type="submit">Send</button></form>' +
+        '<textarea id="lc-i" rows="1" placeholder="Type a message…" maxlength="1500" enterkeyhint="enter"></textarea><button id="lc-go" type="submit">Send</button></form>' +
       '</div>' +
       '<div id="lc-v"><img alt=""><div class="bar"><button id="lc-vs" style="background:' + C.accent + ';color:#fff">💾 Save</button><button id="lc-vc" style="background:#fff;color:#111">Close</button></div></div>';
     document.body.appendChild(root);
@@ -238,7 +238,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       compress(f, function (err, data) {
         if (err) return status(false, 'Could not read that photo');
         var i = $('lc-i'), cap = i.value.trim();
-        if (send({ image: data, text: cap })) i.value = '';
+        if (send({ image: data, text: cap })) { i.value = ''; i.style.height = '44px'; }
       });
     };
 
@@ -262,10 +262,11 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
     try { if (sessionStorage.getItem('lc_seen')) $('lc-l').style.display = 'none'; } catch (_) {}
     if (!shown) { $('lc-b').style.display = 'none'; $('lc-l').style.display = 'none'; }
 
-    function fit() {  // keep the chat above the phone keyboard
+    function fit() {  // keep the whole chat (incl. typing box) inside the visible area above the keyboard
       var vv = window.visualViewport;
-      if (window.innerWidth <= 520 && vv && w.classList.contains('on')) {
-        w.style.top = vv.offsetTop + 'px'; w.style.height = vv.height + 'px'; w.style.bottom = 'auto';
+      if (window.innerWidth <= 520 && w.classList.contains('on')) {
+        var h = vv ? vv.height : window.innerHeight, top = vv ? vv.offsetTop : 0;
+        w.style.top = top + 'px'; w.style.height = h + 'px'; w.style.bottom = 'auto';
         document.body.style.overflow = 'hidden'; toBottom();
       } else { w.style.top = w.style.height = w.style.bottom = ''; }
     }
@@ -283,10 +284,18 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       sendAndOpen: function (text) { this.send(text); open(); }
     };
 
+    var inp = $('lc-i'), touch = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    function grow() { inp.style.height = '44px'; inp.style.height = Math.min(inp.scrollHeight + 2, 120) + 'px'; }
+    function afterKeyboard() { [60, 250, 500].forEach(function (t) { setTimeout(function () { fit(); toBottom(); try { inp.scrollIntoView({ block: 'nearest' }); } catch (_) {} }, t); }); }
+    inp.addEventListener('input', grow);
+    inp.addEventListener('focus', afterKeyboard);
+    inp.addEventListener('keydown', function (e) {   // desktop: Enter sends, Shift+Enter = new line. Phone: Enter = new line, use Send button
+      if (e.key === 'Enter' && !e.shiftKey && !touch) { e.preventDefault(); if ($('lc-f').requestSubmit) $('lc-f').requestSubmit(); else $('lc-go').click(); }
+    });
     $('lc-f').onsubmit = function (e) {
-      e.preventDefault(); var i = $('lc-i'), t = i.value.trim();
-      if (t && send({ text: t })) i.value = '';
-      i.focus();
+      e.preventDefault(); var t = inp.value.trim();
+      if (t && send({ text: t })) { inp.value = ''; grow(); }
+      inp.focus();
     };
 
     function startConnect() {
