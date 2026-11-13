@@ -3,6 +3,7 @@
 Optional data- attributes: title, initial, header, accent, avatar, label, welcome, chips ("A|B|C"), user-key */
 (function () {
   var me = document.currentScript; if (!me) return;
+  if (window.__lcLoaded) return; window.__lcLoaded = true;   // never start two widgets
   var A = function (k, d) { return me.getAttribute('data-' + k) || d; };
   var API = A('api', '');
   var C = {
@@ -248,9 +249,18 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       toBottom(); fit();
       if (window.innerWidth > 520) $('lc-i').focus();
     }
-    function close() { w.classList.remove('on'); $('lc-b').style.display = 'flex'; document.body.style.overflow = ''; }
+    var shown = A('start-hidden', '') ? false : true;   // host page decides where the bubble is visible
+    function close() { w.classList.remove('on'); $('lc-b').style.display = shown ? 'flex' : 'none'; document.body.style.overflow = ''; fit(); }
+    function setVisible(v) {
+      shown = !!v;
+      if (w.classList.contains('on')) return;              // never hide a chat the customer has open
+      $('lc-b').style.display = shown ? 'flex' : 'none';
+      var seen = false; try { seen = !!sessionStorage.getItem('lc_seen'); } catch (_) {}
+      $('lc-l').style.display = shown && !seen ? 'block' : 'none';
+    }
     $('lc-b').onclick = open; $('lc-l').onclick = open; $('lc-x').onclick = close;
     try { if (sessionStorage.getItem('lc_seen')) $('lc-l').style.display = 'none'; } catch (_) {}
+    if (!shown) { $('lc-b').style.display = 'none'; $('lc-l').style.display = 'none'; }
 
     function fit() {  // keep the chat above the phone keyboard
       var vv = window.visualViewport;
@@ -268,6 +278,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
     window.BiasharaChat = {
       open: open,
       close: close,
+      setVisible: setVisible,
       send: function (text) { text = String(text || '').trim(); if (!text) return; if (!send({ text: text })) pending.push(text); },
       sendAndOpen: function (text) { this.send(text); open(); }
     };
@@ -282,6 +293,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       load(connectReal, function () { status(false, 'Chat offline — retrying…'); setTimeout(startConnect, 15000); });
     }
     startConnect();
+    try { window.dispatchEvent(new Event('biashara-chat-ready')); } catch (_) {}
   }
 })();
         
