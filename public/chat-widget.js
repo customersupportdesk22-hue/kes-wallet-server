@@ -70,7 +70,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
       '#lc-b svg{width:30px;height:30px;fill:#fff}' +
       '@keyframes lcp{0%{box-shadow:0 0 0 0 rgba(37,211,102,.55),0 6px 18px rgba(0,0,0,.28)}70%{box-shadow:0 0 0 16px rgba(37,211,102,0),0 6px 18px rgba(0,0,0,.28)}100%{box-shadow:0 0 0 0 rgba(37,211,102,0),0 6px 18px rgba(0,0,0,.28)}}' +
       '#lc-n{position:absolute;top:-4px;right:-4px;min-width:20px;height:20px;border-radius:10px;background:#e53935;color:#fff;font-size:12px;font-weight:700;display:none;align-items:center;justify-content:center;padding:0 5px;border:2px solid #fff}' +
-      '#lc-l{position:fixed;right:88px;bottom:98px;background:#fff;color:' + C.header + ';font-weight:600;font-size:15px;padding:10px 16px;border-radius:20px;box-shadow:0 4px 14px rgba(0,0,0,.18);z-index:99998;cursor:pointer}' +
+      '#lc-l{transition:opacity .45s ease;position:fixed;right:88px;bottom:98px;background:#fff;color:' + C.header + ';font-weight:600;font-size:15px;padding:10px 16px;border-radius:20px;box-shadow:0 4px 14px rgba(0,0,0,.18);z-index:99998;cursor:pointer}' +
       '#lc-w{position:fixed;right:16px;bottom:16px;width:380px;height:min(600px,calc(100vh - 32px));background:#efeae2;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.35);display:none;flex-direction:column;overflow:hidden;z-index:99999;color:#111}' +
       '#lc-w.on{display:flex}' +
       '#lc-h{background:' + C.header + ';color:#fff;padding:12px 14px;display:flex;align-items:center;gap:12px;flex:none}' +
@@ -243,7 +243,7 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
     };
 
     function open() {
-      unlock(); w.classList.add('on'); $('lc-b').style.display = 'none'; $('lc-l').style.display = 'none';
+      unlock(); w.classList.add('on'); $('lc-b').style.display = 'none'; $('lc-l').style.display = 'none'; labelDone = true; if (labelTimer) { clearTimeout(labelTimer); labelTimer = null; }
       unread = 0; $('lc-n').style.display = 'none';
       try { sessionStorage.setItem('lc_seen', '1'); } catch (_) {}
       toBottom(); fit();
@@ -251,12 +251,23 @@ Optional data- attributes: title, initial, header, accent, avatar, label, welcom
     }
     var shown = A('start-hidden', '') ? false : true;   // host page decides where the bubble is visible
     function close() { w.classList.remove('on'); $('lc-b').style.display = shown ? 'flex' : 'none'; document.body.style.overflow = ''; fit(); }
+    var labelTimer = null, labelDone = false, LABEL_MS = (parseFloat(A('label-seconds', '4')) || 4) * 1000;
+    function hideLabel() {
+      var l = $('lc-l'); if (labelTimer) { clearTimeout(labelTimer); labelTimer = null; }
+      l.style.opacity = '0'; setTimeout(function () { l.style.display = 'none'; }, 450);
+    }
     function setVisible(v) {
       shown = !!v;
       if (w.classList.contains('on')) return;              // never hide a chat the customer has open
       $('lc-b').style.display = shown ? 'flex' : 'none';
+      var l = $('lc-l');
+      if (!shown) { l.style.display = 'none'; return; }
+      if (labelDone) { l.style.display = 'none'; return; }
       var seen = false; try { seen = !!sessionStorage.getItem('lc_seen'); } catch (_) {}
-      $('lc-l').style.display = shown && !seen ? 'block' : 'none';
+      if (seen) { labelDone = true; l.style.display = 'none'; return; }
+      if (labelTimer) return;                               // already counting down
+      l.style.display = 'block'; l.style.opacity = '1';     // "Chat with us" shows briefly, then only the button stays
+      labelTimer = setTimeout(function () { labelDone = true; labelTimer = null; hideLabel(); }, LABEL_MS);
     }
     $('lc-b').onclick = open; $('lc-l').onclick = open; $('lc-x').onclick = close;
     try { if (sessionStorage.getItem('lc_seen')) $('lc-l').style.display = 'none'; } catch (_) {}
