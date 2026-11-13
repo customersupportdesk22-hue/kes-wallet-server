@@ -6,6 +6,8 @@ const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 const { Resend } = require('resend');
 const axios = require('axios');
+const http = require('http');
+const { setupChat } = require('./chat-server');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -1864,9 +1866,19 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
 
 // Temporary hard-coded SMS test route removed for security.
 
-connectDB().then(() => {
-  app.listen(PORT, () => console.log('Server running on port ' + PORT));
+connectDB().then(async () => {
+  const server = http.createServer(app);
+  await setupChat(server, {
+    app, db,
+    corsOrigins: (process.env.CHAT_ORIGINS || 'https://biasharaloans.co.ke,https://www.biasharaloans.co.ke').split(','),
+    verifyAdmin: async (token) => {
+      const p = jwt.verify(token, JWT_SECRET);
+      const u = await users.findOne({ _id: new ObjectId(p.userId) }, { projection: { role: 1 } });
+      return !!u && u.role === 'admin';
+    }
+  });
+  server.listen(PORT, () => console.log('Server running on port ' + PORT));
 }).catch(err => {
-  console.error('DB connection failed:', err);
+  console.error('Startup failed:', err);
   process.exit(1);
 });
