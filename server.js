@@ -7,10 +7,17 @@ const { MongoClient, ObjectId } = require('mongodb');
 const { Resend } = require('resend');
 const axios = require('axios');
 const http = require('http');
+const path = require('path');
 const { setupChat } = require('./chat-server');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// Serve the live-chat widget (it was never being served, so the chat button never loaded)
+app.get('/chat-widget.js', (req, res) => {
+  res.set({ 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+  res.sendFile(path.join(__dirname, 'chat-widget.js'));
+});
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
