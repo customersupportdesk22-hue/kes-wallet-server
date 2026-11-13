@@ -157,7 +157,9 @@ async function sendPush(phone, title, message) {
 }
 
 // PUSH + DB ONLY (NO SMS HERE)
-async function notify(phone, title, message, userId) {
+let chatIo = null; // set after setupChat(); used to push notifications to customers instantly
+
+async function notify(phone, title, message, userId, extra = {}) {
   await Promise.allSettled([
     sendPush(phone, title, message)
   ]);
@@ -169,8 +171,10 @@ async function notify(phone, title, message, userId) {
         title: title,
         message: message,
         read: false,
-        created_at: new Date()
+        created_at: new Date(),
+        ...extra
       });
+      if (chatIo) chatIo.notifyUser(userId, { title });
     } catch(e) {
       console.error('Failed to save notification:', e.message);
     }
@@ -932,6 +936,7 @@ app.post('/api/admin/send-notification', auth, async (req, res) => {
     }));
 
     await notifications.insertMany(docs);
+    if (chatIo) docs.forEach(d => chatIo.notifyUser(d.user_id, { title }));
     res.json({ ok: true, sent: docs.length, scope: userId ? 'customer' : 'all_customers' });
   } catch (e) {
     console.error('Admin send notification failed:', e);
@@ -976,6 +981,7 @@ app.post('/api/admin/notifications', auth, async (req, res) => {
       target: target === 'all' ? 'all_customers' : 'individual'
     }));
     await notifications.insertMany(docs);
+    if (chatIo) docs.forEach(d => chatIo.notifyUser(d.user_id, { title }));
     res.json({ ok: true, sent: docs.length, target, created_at: createdAt });
   } catch (e) {
     console.error('Admin notification error:', e);
@@ -1012,7 +1018,9 @@ app.get('/api/notifications', auth, async (req, res) => {
       title: n.title,
       message: n.message,
       read: n.read === true,
-      created_at: n.created_at
+      created_at: n.created_at,
+      type: n.type || null,
+      transaction_id: n.transaction_id || null
     }));
 
     const unreadCount = await notifications.countDocuments({
@@ -1640,7 +1648,7 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    await txs.insertOne({
+    const inTx = await txs.insertOne({
       user_id: recipient._id.toString(),
       type: 'transfer_in',
       amount: amt,
@@ -1651,7 +1659,8 @@ app.post('/api/wallet/transfer', auth, async (req, res) => {
       created_at: new Date(),
     });
 
-    notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`, recipient._id.toString());
+    notify(recipient.phone, '💰 Money Received', `You received KES ${amt.toLocaleString()} from ${sender.name.split(' ')[0]}.`, recipient._id.toString(),
+      { type: 'money_received', transaction_id: inTx.insertedId.toString() });
 
     const updated = await getUserById(req.userId);
     res.json({ balance: updated.balance, recipient: { name: recipient.name, phone: recipient.phone } });
@@ -1879,8 +1888,9 @@ app.get('/api/admin/pwa-installs', auth, async (req, res) => {
 
 connectDB().then(async () => {
   const server = http.createServer(app);
-  await setupChat(server, {
+  chatIo = await setupChat(server, {
     app, db,
+    verifyUser: async (token) => { const p = jwt.verify(token, JWT_SECRET); return p.userId; },
     corsOrigins: (process.env.CHAT_ORIGINS || 'https://biasharaloans.co.ke,https://www.biasharaloans.co.ke').split(','),
     verifyAdmin: async (token) => {
       const p = jwt.verify(token, JWT_SECRET);

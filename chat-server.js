@@ -35,7 +35,7 @@ const pub = (m) => ({
  *  - db: your connected MongoDB Db object (the same one the rest of server.js uses)
  *  - verifyAdmin(token) -> true/false (or Promise): your existing JWT check + role === 'admin'
  */
-async function setupChat(httpServer, { app, db, verifyAdmin, corsOrigins = '*' }) {
+async function setupChat(httpServer, { app, db, verifyAdmin, verifyUser, corsOrigins = '*' }) {
   const Threads = db.collection('chat_threads');
   const Messages = db.collection('chat_messages');
   const Images = db.collection('chat_images');
@@ -43,6 +43,20 @@ async function setupChat(httpServer, { app, db, verifyAdmin, corsOrigins = '*' }
   await Messages.createIndex({ visitorId: 1, createdAt: 1 });
 
   const io = new Server(httpServer, { cors: { origin: corsOrigins }, maxHttpBufferSize: 5e6 });
+
+  // ---- Realtime customer notifications (namespace /notify) ----
+  // Customers connect with their login token and join a private room; the server pushes to that room.
+  const nsp = io.of('/notify');
+  nsp.use(async (socket, next) => {
+    try {
+      const uid = verifyUser ? await verifyUser((socket.handshake.auth || {}).token) : null;
+      if (!uid) return next(new Error('unauthorized'));
+      socket.data.uid = String(uid);
+      next();
+    } catch (e) { next(new Error('unauthorized')); }
+  });
+  nsp.on('connection', (socket) => socket.join('u:' + socket.data.uid));
+  io.notifyUser = (userId, payload) => { try { nsp.to('u:' + String(userId)).emit('notification', payload || {}); } catch (_) {} };
 
   if (app) {
     app.get('/chat-image/:id', async (req, res) => {
