@@ -16,7 +16,11 @@ app.use(express.json({ limit: '50mb' }));
 // Serve the live-chat widget (it was never being served, so the chat button never loaded)
 app.get('/chat-widget.js', (req, res) => {
   res.set({ 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
-  res.sendFile(path.join(__dirname, 'chat-widget.js'));
+  const fs = require('fs');
+  const candidates = [path.join(__dirname, 'public', 'chat-widget.js'), path.join(__dirname, 'chat-widget.js')];
+  const file = candidates.find((f) => fs.existsSync(f));
+  if (!file) return res.status(404).send('chat-widget.js not found on server');
+  res.sendFile(file);
 });
 
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
