@@ -968,14 +968,18 @@ app.post('/api/admin/notifications', auth, async (req, res) => {
       if (!customer) return res.status(404).json({ error: 'Customer not found' });
       recipients = [customer];
     } else {
-      recipients = await users.find({ role: { $ne: 'admin' } }, { projection: { _id: 1 } }).toArray();
+      recipients = await users.find({ role: { $ne: 'admin' } }, { projection: { _id: 1, name: 1, phone: 1 } }).toArray();
     }
     if (!recipients.length) return res.status(404).json({ error: 'No customers found' });
     const createdAt = new Date();
     const expiry = req.body.expiresAt ? new Date(req.body.expiresAt) : null;
     if (expiry && Number.isNaN(expiry.getTime())) return res.status(400).json({ error: 'Invalid expiry date' });
+    const fillTags = (txt, u) => txt
+      .replace(/\{name\}/gi, (u.name || 'Customer').split(' ')[0])
+      .replace(/\{fullname\}/gi, u.name || 'Customer')
+      .replace(/\{phone\}/gi, u.phone || '');
     const docs = recipients.map(u => ({
-      user_id: u._id.toString(), title, message, read: false, created_at: createdAt,
+      user_id: u._id.toString(), title: fillTags(title, u), message: fillTags(message, u), read: false, created_at: createdAt,
       sent_by: admin._id.toString(), type: 'admin', category,
       expires_at: expiry && expiry > createdAt ? expiry : null,
       target: target === 'all' ? 'all_customers' : 'individual'
@@ -997,7 +1001,7 @@ app.get('/api/admin/notifications', auth, async (req, res) => {
     const docs = await notifications.find({ sent_by: req.userId, type: 'admin' }).sort({ created_at: -1 }).limit(500).toArray();
     const grouped = new Map();
     for (const n of docs) {
-      const key = [n.title, n.message, new Date(n.created_at).toISOString()].join('|');
+      const key = (n.target === 'all_customers') ? ['all', n.category || '', new Date(n.created_at).toISOString()].join('|') : [n._id].join('|');
       if (!grouped.has(key)) grouped.set(key, { title:n.title, message:n.message, target:n.target || 'individual', category:n.category || 'general', created_at:n.created_at, recipients:0 });
       grouped.get(key).recipients++;
     }
@@ -1723,6 +1727,83 @@ app.get('/api/admin/pending-withdrawals', auth, async (req, res) => {
   }
 });
 
+// ============ AI NOTIFICATION DRAFTER (admin only) ============
+// Free: set GEMINI_API_KEY on Render (optional GEMINI_MODEL). Paid alternative: ANTHROPIC_API_KEY.
+app.post('/api/admin/ai-draft', auth, async (req, res) => {
+  try {
+    const admin = await getUserById(req.userId);
+    if (!admin || admin.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+    const geminiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!geminiKey && !apiKey) return res.status(503).json({ error: 'AI is not set up. Add GEMINI_API_KEY (free) on Render.' });
+
+    const instruction = String(req.body.instruction || '').trim().slice(0, 600);
+    const category = String(req.body.category || 'general').slice(0, 40);
+    const tone = ['formal', 'friendly', 'celebratory', 'urgent'].includes(req.body.tone) ? req.body.tone : 'friendly';
+    if (!instruction) return res.status(400).json({ error: 'Tell the AI what the message is about' });
+
+    const system = [
+      'You write customer notifications for Biashara Loans, a Kenyan digital lending company.',
+      'Write clear, polite, professional English suited to Kenyan customers. Tone: ' + tone + '.',
+      'Use the placeholder {name} where the customer first name belongs. Do not invent names.',
+      'Use only facts given in the admin instruction. NEVER invent amounts, dates, fees, interest rates, reference numbers or M-Pesa codes.',
+      'If the instruction includes an M-Pesa code or amount, copy it exactly as given. If it does not, do not mention one.',
+      'Never promise guaranteed approval. Never ask customers to send money or share their PIN or password.',
+      'Title: max 60 characters. Message: max 450 characters. At most two fitting emojis total.',
+      'Reply with ONLY valid JSON: {"title":"...","message":"..."}'
+    ].join(' ');
+
+    const userText = 'Category: ' + category + '\nAdmin instruction: ' + instruction;
+    let text = '';
+    if (geminiKey) {
+      // Free option: Google Gemini (key from aistudio.google.com)
+      const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: system }] },
+          contents: [{ role: 'user', parts: [{ text: userText }] }],
+          generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 600, temperature: 0.7 }
+        })
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.error('Gemini draft failed:', r.status, data && data.error);
+        return res.status(502).json({ error: r.status === 429 ? 'AI limit reached for now. Wait a minute and try again.' : 'AI service error. Try again.' });
+      }
+      const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
+      text = parts.map(p => p.text || '').join('').replace(/```json|```/g, '').trim();
+    } else {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5',
+          max_tokens: 600,
+          system,
+          messages: [{ role: 'user', content: userText }]
+        })
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        console.error('AI draft failed:', r.status, data && data.error);
+        return res.status(502).json({ error: 'AI service error. Try again.' });
+      }
+      text = (data.content || []).map(c => c.text || '').join('').replace(/```json|```/g, '').trim();
+    }
+    let out;
+    try { out = JSON.parse(text); } catch (_) { return res.status(502).json({ error: 'AI reply was not readable. Try again.' }); }
+    const title = String(out.title || '').trim().slice(0, 100);
+    const message = String(out.message || '').trim().slice(0, 1500);
+    if (!title || !message) return res.status(502).json({ error: 'AI returned an empty draft. Try again.' });
+    res.json({ ok: true, title, message });
+  } catch (e) {
+    console.error('AI draft error:', e);
+    res.status(500).json({ error: 'AI draft failed' });
+  }
+});
+
 app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
   try {
     const admin = await getUserById(req.userId);
@@ -1730,12 +1811,15 @@ app.post('/api/admin/approve-withdrawal', auth, async (req, res) => {
 
     const { txId, mpesaReceipt } = req.body;
     if (!txId) return res.status(400).json({ error: 'Missing transaction ID' });
+    if (!/^[A-Z0-9]{10}$/.test(String(mpesaReceipt || '').trim().toUpperCase())) {
+      return res.status(400).json({ error: 'Enter the real 10-character M-Pesa receipt code from the payment SMS' });
+    }
 
     const tx = await txs.findOne({ _id: new ObjectId(txId), type: 'withdrawal' });
     if (!tx) return res.status(404).json({ error: 'Transaction not found' });
     if (tx.status === 'completed') return res.status(400).json({ error: 'Already completed' });
 
-    const finalReceipt = mpesaReceipt || ('QK' + Date.now().toString().slice(-8));
+    const finalReceipt = String(mpesaReceipt).trim().toUpperCase();
 
     await txs.updateOne(
       { _id: new ObjectId(txId) },
