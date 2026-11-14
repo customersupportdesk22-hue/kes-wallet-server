@@ -1770,7 +1770,8 @@ app.post('/api/admin/ai-draft', auth, async (req, res) => {
       const data = await r.json().catch(() => ({}));
       if (!r.ok) {
         console.error('Gemini draft failed:', r.status, data && data.error);
-        return res.status(502).json({ error: r.status === 429 ? 'AI limit reached for now. Wait a minute and try again.' : 'AI service error. Try again.' });
+        const why = (data && data.error && data.error.message) ? String(data.error.message).slice(0, 140) : '';
+        return res.status(502).json({ error: r.status === 429 ? 'AI limit reached for now. Wait a minute and try again.' : 'Gemini error ' + r.status + (why ? ': ' + why : '') });
       }
       const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
       text = parts.map(p => p.text || '').join('').replace(/```json|```/g, '').trim();
