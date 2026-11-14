@@ -1757,7 +1757,7 @@ app.post('/api/admin/ai-draft', auth, async (req, res) => {
     let text = '';
     if (geminiKey) {
       // Free option: Google Gemini (key from aistudio.google.com)
-      const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+      const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
