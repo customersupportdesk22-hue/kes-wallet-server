@@ -1756,25 +1756,44 @@ app.post('/api/admin/ai-draft', auth, async (req, res) => {
     const userText = 'Category: ' + category + '\nAdmin instruction: ' + instruction;
     let text = '';
     if (geminiKey) {
-      // Free option: Google Gemini (key from aistudio.google.com)
-      const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
-      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: 'user', parts: [{ text: userText }] }],
-          generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 600, temperature: 0.7 }
-        })
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        console.error('Gemini draft failed:', r.status, data && data.error);
-        const why = (data && data.error && data.error.message) ? String(data.error.message).slice(0, 140) : '';
-        return res.status(502).json({ error: r.status === 429 ? 'AI limit reached for now. Wait a minute and try again.' : 'Gemini error ' + r.status + (why ? ': ' + why : '') });
+      // Free option: Google Gemini. If one model is busy/unavailable, try the next one automatically.
+      const models = [process.env.GEMINI_MODEL || 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']
+        .filter((m, i, arr) => arr.indexOf(m) === i);
+      let lastStatus = 0, lastWhy = '', done = false;
+      for (const model of models) {
+        let r, data;
+        try {
+          r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: system }] },
+              contents: [{ role: 'user', parts: [{ text: userText }] }],
+              generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 2000, temperature: 0.7 }
+            }),
+            signal: AbortSignal.timeout(20000)
+          });
+          data = await r.json().catch(() => ({}));
+        } catch (err) {
+          lastStatus = 504; lastWhy = 'timeout';
+          console.error('Gemini ' + model + ' timeout/network:', err && err.name);
+          continue;
+        }
+        if (r.ok) {
+          const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
+          text = parts.map(p => p.text || '').join('').replace(/```json|```/g, '').trim();
+          done = true;
+          break;
+        }
+        lastStatus = r.status;
+        lastWhy = (data && data.error && data.error.message) ? String(data.error.message).slice(0, 140) : '';
+        console.error('Gemini ' + model + ' failed:', r.status, lastWhy);
+        if (![429, 500, 503, 504, 404].includes(r.status)) break;   // key/request problem: other models will not help
       }
-      const parts = (((data.candidates || [])[0] || {}).content || {}).parts || [];
-      text = parts.map(p => p.text || '').join('').replace(/```json|```/g, '').trim();
+      if (!done) {
+        const busy = [429, 503, 504].includes(lastStatus);
+        return res.status(502).json({ error: busy ? 'Google AI is busy right now. Wait a minute and tap Generate again.' : 'Gemini error ' + lastStatus + (lastWhy ? ': ' + lastWhy : '') });
+      }
     } else {
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -1801,7 +1820,8 @@ app.post('/api/admin/ai-draft', auth, async (req, res) => {
     res.json({ ok: true, title, message });
   } catch (e) {
     console.error('AI draft error:', e);
-    res.status(500).json({ error: 'AI draft failed' });
+    const timedOut = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    res.status(timedOut ? 504 : 500).json({ error: timedOut ? 'AI took too long. Tap Generate again.' : 'AI draft failed' });
   }
 });
 
